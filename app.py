@@ -1,27 +1,21 @@
-import sys
-import os
+
 import streamlit as st
-
-# Ensure root path is visible
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
 from modules.product import check_access
+from pages.game_lines import run as run_games
+from pages.player_props import run as run_props
+from pages.ufc_props import run as run_ufc
 
 st.set_page_config(page_title="EdgeLedger", layout="wide")
+st.title("EdgeLedger — Betting Intelligence Platform")
 
-st.title("📊 EdgeLedger Betting Intelligence")
+user = st.session_state.get("user", {"plan": "free"})
+check_access(user)
 
-if not check_access():
-    st.warning("Access restricted")
-    st.stop()
+page = st.sidebar.radio("Navigation", ["Game Lines", "Player Props", "UFC Props"])
 
-st.success("App loaded successfully")
-
-st.markdown("""
-Welcome to **EdgeLedger**.
-
-Use the sidebar to navigate:
-- Game Lines
-- Player Props
-- UFC Props
-""")
+if page == "Game Lines":
+    run_games(user)
+elif page == "Player Props":
+    run_props(user)
+else:
+    run_ufc(user)

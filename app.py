@@ -72,9 +72,9 @@ def normalize_game(raw):
     if not raw:
         return pd.DataFrame()
     for g in raw:
-        matchup = f"{g.get('away_team')} @ {g.get('home_team')}"
+        matchup = f"{g.get('away_team', 'Unknown')} @ {g.get('home_team', 'Unknown')}"
         for b in g.get("bookmakers", []):
-            book = b.get("title")
+            book = b.get("title", "Unknown Book")
             for m in g.get("markets", []):
                 for o in m.get("outcomes", []):
                     rows.append({
@@ -125,21 +125,29 @@ def normalize_props(raw):
     rows = []
     if not raw:
         return pd.DataFrame()
-    ev = raw[0]
-    matchup = f"{ev.get('away_team')} @ {ev.get('home_team')}"
-    for b in ev.get("bookmakers", []):
-        book = b.get("title")
-        for m in ev.get("markets", []):
-            for o in m.get("outcomes", []):
-                rows.append({
-                    "entity": o.get("description", o.get("name")),
-                    "market": m.get("key"),
-                    "prop_side": o.get("name"),
-                    "line": o.get("point"),
-                    "odds": o.get("price"),
-                    "book": book,
-                    "matchup": matchup
-                })
+
+    # Ensure raw is a list
+    if isinstance(raw, dict):
+        raw = [raw]
+
+    for ev in raw:
+        matchup = f"{ev.get('away_team', 'Unknown')} @ {ev.get('home_team', 'Unknown')}"
+        bookmakers = ev.get("bookmakers", [])
+        if not bookmakers:
+            continue
+        for b in bookmakers:
+            book = b.get("title", "Unknown Book")
+            for m in b.get("markets", []):
+                for o in m.get("outcomes", []):
+                    rows.append({
+                        "entity": o.get("description", o.get("name")),
+                        "market": m.get("key"),
+                        "prop_side": o.get("name"),
+                        "line": o.get("point"),
+                        "odds": o.get("price"),
+                        "book": book,
+                        "matchup": matchup
+                    })
     return pd.DataFrame(rows)
 
 def best_price(df, group_cols):
@@ -203,7 +211,7 @@ else:
     if not events:
         st.stop()
 
-    event_options = {f"{e['away_team']} @ {e['home_team']}": e["id"] for e in events}
+    event_options = {f"{e.get('away_team', 'Unknown')} @ {e.get('home_team', 'Unknown')}": e["id"] for e in events}
     selected_event = st.sidebar.selectbox("Event", list(event_options.keys()))
     event_id = event_options[selected_event]
 

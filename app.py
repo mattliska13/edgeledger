@@ -18,10 +18,11 @@ SPORT_MAP = {
     "UFC": "mma_mixed_martial_arts"
 }
 
-GAME_MARKETS = {
-    "Spread": "spreads",
-    "Total": "totals",
-    "Moneyline": "h2h"
+BOOK_WEIGHTS = {
+    "DraftKings": 1.0,
+    "FanDuel": 1.0,
+    "Pinnacle": 1.2,
+    "Circa Sports": 1.15
 }
 
 PLAYER_PROP_TYPES = {
@@ -31,41 +32,37 @@ PLAYER_PROP_TYPES = {
     "Receiving Yards": "player_rec_yds"
 }
 
-BOOK_WEIGHTS = {
-    "DraftKings": 1.0,
-    "FanDuel": 1.0,
-    "Pinnacle": 1.2,
-    "Circa Sports": 1.15
-}
-
 # -------------------------
-# Helper functions
+# Helper Functions
 # -------------------------
 def american_to_prob(odds):
     if odds > 0:
         return 100 / (odds + 100)
     return -odds / (-odds + 100)
 
-def fetch_game_odds(sport, market):
-    url = f"https://api.the-odds-api.com/v4/sports/{SPORT_MAP[sport]}/odds"
+def fetch_odds_api(url, params):
     try:
-        resp = requests.get(
-            url,
-            params={
-                "apiKey": API_KEY,
-                "regions": "us",
-                "markets": market,
-                "oddsFormat": "american"
-            },
-            timeout=10
-        )
+        resp = requests.get(url, params=params, timeout=10)
         data = resp.json() if resp.status_code == 200 else []
         if not data:
-            st.warning(f"No game line data returned for {sport} / {market}.")
+            st.warning(f"No data returned from API for url: {url}")
+        st.write(f"DEBUG API response ({url}):", data)  # debug log
         return data
     except Exception as e:
-        st.error(f"Error fetching game odds: {e}")
+        st.error(f"API request failed: {e}")
         return []
+
+def fetch_game_odds(sport):
+    url = f"https://api.the-odds-api.com/v4/sports/{SPORT_MAP[sport]}/odds"
+    # UFC only supports h2h
+    markets = ["spreads", "totals", "h2h"] if sport != "UFC" else ["h2h"]
+    params = {
+        "apiKey": API_KEY,
+        "regions": "us",
+        "markets": ",".join(markets),
+        "oddsFormat": "american"
+    }
+    return fetch_odds_api(url, params)
 
 def normalize_game(raw):
     rows = []
@@ -73,9 +70,12 @@ def normalize_game(raw):
         return pd.DataFrame()
     for g in raw:
         matchup = f"{g.get('away_team', 'Unknown')} @ {g.get('home_team', 'Unknown')}"
-        for b in g.get("bookmakers", []):
+        bookmakers = g.get("bookmakers", [])
+        if not bookmakers:
+            continue  # skip empty
+        for b in bookmakers:
             book = b.get("title", "Unknown Book")
-            for m in g.get("markets", []):
+            for m in b.get("markets", []):
                 for o in m.get("outcomes", []):
                     rows.append({
                         "entity": matchup,
@@ -90,36 +90,18 @@ def normalize_game(raw):
 
 def fetch_events(sport):
     url = f"https://api.the-odds-api.com/v4/sports/{SPORT_MAP[sport]}/events"
-    try:
-        resp = requests.get(url, params={"apiKey": API_KEY, "regions": "us"}, timeout=10)
-        events = resp.json() if resp.status_code == 200 else []
-        if not events:
-            st.warning(f"No upcoming events found for {sport}.")
-        return events
-    except Exception as e:
-        st.error(f"Error fetching events: {e}")
-        return []
+    params = {"apiKey": API_KEY, "regions": "us"}
+    return fetch_odds_api(url, params)
 
-def fetch_event_odds(sport, event_id, market):
+def fetch_event_props(sport, event_id, prop_market):
     url = f"https://api.the-odds-api.com/v4/sports/{SPORT_MAP[sport]}/events/{event_id}/odds"
-    try:
-        resp = requests.get(
-            url,
-            params={
-                "apiKey": API_KEY,
-                "regions": "us",
-                "markets": market,
-                "oddsFormat": "american"
-            },
-            timeout=10
-        )
-        data = resp.json() if resp.status_code == 200 else []
-        if not data:
-            st.warning(f"No player props returned for event ID {event_id}.")
-        return data
-    except Exception as e:
-        st.error(f"Error fetching player props: {e}")
-        return []
+    params = {
+        "apiKey": API_KEY,
+        "regions": "us",
+        "markets": prop_market,
+        "oddsFormat": "american"
+    }
+    return fetch_odds_api(url, params)
 
 def normalize_props(raw):
     rows = []
@@ -129,9 +111,12 @@ def normalize_props(raw):
         raw = [raw]
     for ev in raw:
         matchup = f"{ev.get('away_team', 'Unknown')} @ {ev.get('home_team', 'Unknown')}"
-        for b in ev.get("bookmakers", []):
+        bookmakers = ev.get("bookmakers", [])
+        if not bookmakers:
+            continue
+        for b in bookmakers:
             book = b.get("title", "Unknown Book")
-            for m in ev.get("markets", []):
+            for m in b.get("markets", []):
                 for o in m.get("outcomes", []):
                     rows.append({
                         "entity": o.get("description", o.get("name")),
@@ -178,19 +163,18 @@ scope = st.sidebar.radio("Scope", ["Game Lines", "Player Props"])
 # Game Lines
 # -------------------------
 if scope == "Game Lines":
-    market = st.sidebar.selectbox("Market", list(GAME_MARKETS.keys()))
-    raw = fetch_game_odds(sport, GAME_MARKETS[market])
+    raw = fetch_game_odds(sport)
     if not raw:
         st.stop()
     df = normalize_game(raw)
     if df.empty:
-        st.warning("No normalized game lines available.")
+        st.warning("No normalized game lines available for this sport right now.")
         st.stop()
     df = best_price(df, ["entity", "market", "side"])
-    st.subheader(f"{sport} — {market} (Top Lines by EV)")
+    st.subheader(f"{sport} — Game Lines (Top by EV)")
     display_df(df, scope)
 
-    # Auto-Ranked top 2–5
+    # Auto-Ranked Top 2-5
     top_n = min(max(2, int(len(df)*0.1)), 5)
     auto_bets = df.sort_values("ev", ascending=False).head(top_n)
     st.subheader(f"Auto-Ranked Top {top_n} Game Lines by EV")
@@ -202,27 +186,31 @@ if scope == "Game Lines":
 else:
     events = fetch_events(sport)
     if not events:
+        st.warning("No upcoming events available for player props.")
         st.stop()
+
     event_options = {f"{e.get('away_team','Unknown')} @ {e.get('home_team','Unknown')}": e["id"] for e in events}
     selected_event = st.sidebar.selectbox("Event", list(event_options.keys()))
     event_id = event_options[selected_event]
 
-    # New dropdown: Player Prop Type
+    # Dropdown for prop type
     prop_type_label = st.sidebar.selectbox("Prop Type", list(PLAYER_PROP_TYPES.keys()))
-    prop_market = [PLAYER_PROP_TYPES[prop_type_label]]  # must be list for API
+    prop_market = [PLAYER_PROP_TYPES[prop_type_label]]  # API expects a list
 
-    raw = fetch_event_odds(sport, event_id, prop_market)
+    raw = fetch_event_props(sport, event_id, prop_market)
     if not raw:
+        st.warning("No player props returned for selected event/prop type.")
         st.stop()
+
     df = normalize_props(raw)
     if df.empty:
-        st.warning("No normalized player props available.")
+        st.warning("No normalized player props available for this event/prop type.")
         st.stop()
     df = best_price(df, ["entity", "market", "prop_side", "line"])
     st.subheader(f"{sport} — Player Props — {selected_event} — {prop_type_label} (Top by EV)")
     display_df(df, scope)
 
-    # Auto-Ranked top 2–5
+    # Auto-Ranked Top 2-5 Player Props
     top_n = min(max(2, int(len(df)*0.1)), 5)
     auto_bets = df.sort_values("ev", ascending=False).head(top_n)
     st.subheader(f"Auto-Ranked Top {top_n} Player Props by EV")

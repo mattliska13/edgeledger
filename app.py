@@ -1,157 +1,161 @@
 import streamlit as st
-import pandas as pd
 import requests
-import logging
+import pandas as pd
+import numpy as np
 
-# -----------------------
-# CONFIG & LOGGING
-# -----------------------
 st.set_page_config(page_title="EdgeLedger", layout="wide")
-logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 
-API_KEY = st.secrets.get("ODDS_API_KEY")
-if not API_KEY:
-    st.error("API_KEY not found in secrets.toml")
-    st.stop()
-logging.debug("API_KEY loaded successfully")
+# -----------------------------
+# CONFIG
+# -----------------------------
+API_KEY = st.secrets["ODDS_API_KEY"]
+REGION = "us"
+ODDS_FORMAT = "american"
 
-# -----------------------
-# UTILITY FUNCTIONS
-# -----------------------
-def fetch_odds(sport_key, markets):
-    """Fetch odds from The Odds API."""
+# Supported sports
+SPORTS = {
+    "NFL": "americanfootball_nfl",
+    "CFB": "americanfootball_college"
+}
+
+# Player prop types
+PLAYER_PROPS = {
+    "Passing TDs": "player_pass_tds",
+    "Passing Yards": "player_pass_yds",
+    "Rushing Yards": "player_rush_yds",
+    "Receiving Yards": "player_rec_yds",
+    "Anytime TD": "player_anytime_td"
+}
+
+# -----------------------------
+# UTILITIES
+# -----------------------------
+def american_to_decimal(odds):
+    if odds > 0:
+        return odds / 100 + 1
+    else:
+        return 100 / -odds + 1
+
+def calc_ev(american_odds, probability):
+    dec_odds = american_to_decimal(american_odds)
+    return probability * (dec_odds - 1) - (1 - probability)
+
+def highlight_best(val, col_vals):
+    return "background-color: #b6fcd5" if val == col_vals.max() else ""
+
+# -----------------------------
+# STREAMLIT UI
+# -----------------------------
+st.title("EdgeLedger")
+
+sport_name = st.selectbox("Sport", list(SPORTS.keys()))
+scope = st.selectbox("Scope", ["Game Lines", "Player Props"])
+
+sport_key = SPORTS[sport_name]
+
+player_prop_type = None
+if scope == "Player Props":
+    player_prop_name = st.selectbox("Player Prop Type", list(PLAYER_PROPS.keys()))
+    player_prop_type = PLAYER_PROPS[player_prop_name]
+
+st.text(f"DEBUG: API_KEY loaded successfully")
+st.text(f"DEBUG: Using sport_key={sport_key}, scope={scope}, player_prop_type={player_prop_type}")
+
+# -----------------------------
+# FETCH DATA
+# -----------------------------
+def fetch_game_lines():
+    markets = ["h2h", "spreads", "totals"]
+    st.text(f"DEBUG: Requesting markets: {markets}")
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {
         "apiKey": API_KEY,
-        "regions": "us",
+        "regions": REGION,
         "markets": ",".join(markets),
-        "oddsFormat": "american"
+        "oddsFormat": ODDS_FORMAT
     }
-    logging.debug(f"Fetching {sport_key} with markets={markets}")
     r = requests.get(url, params=params)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    st.text(f"DEBUG: API returned {len(data)} events for {sport_name}")
+    return data
 
-def american_to_decimal(odds):
-    """Convert American odds to decimal for EV calculation."""
-    if odds > 0:
-        return (odds / 100) + 1
-    else:
-        return (100 / abs(odds)) + 1
+def fetch_player_props():
+    # Step 1: fetch events
+    url_events = f"https://api.the-odds-api.com/v4/sports/{sport_key}/events"
+    r = requests.get(url_events, params={"apiKey": API_KEY, "regions": REGION})
+    r.raise_for_status()
+    events = r.json()
+    st.text(f"DEBUG: API returned {len(events)} events for {sport_name}")
 
-def implied_probability(odds):
-    return 1 / american_to_decimal(odds)
+    all_props = []
 
-def calc_ev(decimal_odds, implied_prob):
-    return round(implied_prob * decimal_odds - 1, 4)
+    # Step 2: fetch props per event
+    for event in events:
+        event_id = event["id"]
+        url_props = f"https://api.the-odds-api.com/v4/sports/{sport_key}/events/{event_id}/odds"
+        params = {
+            "apiKey": API_KEY,
+            "regions": REGION,
+            "markets": player_prop_type,
+            "oddsFormat": ODDS_FORMAT
+        }
+        try:
+            r_prop = requests.get(url_props, params=params)
+            r_prop.raise_for_status()
+            props = r_prop.json()
+            for p in props:
+                for market in p.get("bookmakers", []):
+                    for outcome in market.get("markets", []):
+                        if outcome["key"] == player_prop_type:
+                            for o in outcome["outcomes"]:
+                                all_props.append({
+                                    "Event": p["home_team"] + " vs " + p["away_team"],
+                                    "Outcome": o["name"],
+                                    "Bookmaker": market["title"],
+                                    "Price": o["price"]
+                                })
+        except requests.HTTPError as e:
+            st.warning(f"Skipping event {event_id} due to HTTPError: {e}")
+    return pd.DataFrame(all_props)
 
-def highlight_best(cell, line, df):
-    """Highlight best bookmaker per line/outcome."""
-    subset = df[df["Line"] == line]
-    if not subset.empty:
-        if cell == subset["AmericanOdds"].max():
-            return "background-color: #b3ffb3"  # light green
-    return ""
-
-# -----------------------
-# APP SIDEBAR
-# -----------------------
-st.sidebar.title("EdgeLedger — Sports Betting")
-sport_name = st.sidebar.selectbox("Sport", ["NFL", "CFB"])
-scope = st.sidebar.selectbox("Scope", ["Game Lines", "Player Props"])
-
-player_prop_type = None
-if scope == "Player Props" and sport_name in ["NFL", "CFB"]:
-    player_prop_type = st.sidebar.selectbox(
-        "Player Prop Type",
-        ["Touchdowns", "Passing Yards", "Rushing Yards", "Receiving Yards"]
-    )
-
-# -----------------------
-# MAP SPORT KEYS
-# -----------------------
-SPORT_KEYS = {
-    "NFL": "americanfootball_nfl",
-    "CFB": "americanfootball_college_football",
-}
-sport_key = SPORT_KEYS[sport_name]
-logging.debug(f"Using sport_key={sport_key}, scope={scope}, player_prop_type={player_prop_type}")
-
-# -----------------------
-# BUILD MARKETS
-# -----------------------
-markets = []
+# -----------------------------
+# PROCESS & DISPLAY
+# -----------------------------
 if scope == "Game Lines":
-    markets = ["h2h", "spreads", "totals"]
+    raw_data = fetch_game_lines()
+    # Flatten for display
+    rows = []
+    for event in raw_data:
+        event_name = event["home_team"] + " vs " + event["away_team"]
+        for bookmaker in event["bookmakers"]:
+            for market in bookmaker["markets"]:
+                for outcome in market["outcomes"]:
+                    rows.append({
+                        "Event": event_name,
+                        "Outcome": outcome["name"],
+                        "Bookmaker": bookmaker["title"],
+                        "Price": outcome["price"]
+                    })
+    df = pd.DataFrame(rows)
 elif scope == "Player Props":
-    markets = ["player_props"]  # always fetch player_props
+    df = fetch_player_props()
 
-# -----------------------
-# FETCH DATA
-# -----------------------
-try:
-    events = fetch_odds(sport_key, markets)
-    logging.debug(f"API returned {len(events)} events for {sport_name}")
-except requests.HTTPError as e:
-    st.error(f"HTTPError: {e}")
-    st.stop()
+if df.empty:
+    st.warning("No data found for this selection.")
+else:
+    # Calculate implied probability and EV
+    df["Decimal"] = df["Price"].apply(american_to_decimal)
+    df["ImpliedProb"] = 1 / df["Decimal"]
+    df["EV"] = df.apply(lambda x: calc_ev(x["Price"], x["ImpliedProb"]), axis=1)
 
-# -----------------------
-# NORMALIZE DATA
-# -----------------------
-prop_filter_map = {
-    "Touchdowns": "touchdown",
-    "Passing Yards": "passing yards",
-    "Rushing Yards": "rushing yards",
-    "Receiving Yards": "receiving yards"
-}
+    # Rank top bets
+    top_bets = df.sort_values("EV", ascending=False).head(5)
 
-rows = []
-for event in events:
-    event_name = (
-        f"{event.get('home_team')} vs {event.get('away_team')}"
-        if "home_team" in event else event.get("name", "")
+    # Highlight best bookmaker per line/outcome
+    styled = top_bets.style.apply(
+        lambda x: [highlight_best(v, top_bets[top_bets["Outcome"]==x["Outcome"]]["Price"]) for v in x], axis=1
     )
-    for bookmaker in event.get("bookmakers", []):
-        for market in bookmaker.get("markets", []):
-            for outcome in market.get("outcomes", []):
-                if scope == "Player Props" and player_prop_type:
-                    filter_keyword = prop_filter_map[player_prop_type].lower()
-                    if filter_keyword not in outcome["name"].lower():
-                        continue
-                decimal_odds = american_to_decimal(outcome["price"])
-                rows.append({
-                    "Event": event_name,
-                    "Bookmaker": bookmaker["title"],
-                    "Line": outcome.get("name", outcome.get("label", "")),
-                    "AmericanOdds": outcome["price"],  # Keep original American odds
-                    "DecimalOdds": decimal_odds,
-                    "ImpliedProb": implied_probability(outcome["price"]),
-                    "EV": calc_ev(decimal_odds, implied_probability(outcome["price"])),
-                    "Outcome": outcome["name"]
-                })
 
-if not rows:
-    st.warning("No normalized data available.")
-    st.stop()
-
-df = pd.DataFrame(rows)
-
-# -----------------------
-# TOP BETS RANKING
-# -----------------------
-top_bets = df.sort_values(by="EV", ascending=False).head(5)
-
-# -----------------------
-# DISPLAY
-# -----------------------
-st.title(f"EdgeLedger — {scope} ({sport_name})")
-st.subheader("Top Bets Ranked by EV")
-
-# Highlight best bookmaker
-styled = top_bets.style.applymap(lambda x: highlight_best(x, top_bets["Line"], top_bets), subset=["AmericanOdds"])
-st.dataframe(styled, use_container_width=True)
-
-# Show all available lines for transparency
-st.subheader("All Available Lines")
-st.dataframe(df, use_container_width=True)
+    st.subheader(f"Top Bets Ranked by EV — {scope}")
+    st.dataframe(styled, use_container_width=True)

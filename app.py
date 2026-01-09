@@ -39,7 +39,7 @@ BOOK_WEIGHTS = {
 }
 
 # -------------------------
-# Helpers
+# Helper functions
 # -------------------------
 def american_to_prob(odds):
     if odds > 0:
@@ -48,20 +48,29 @@ def american_to_prob(odds):
 
 def fetch_game_odds(sport, market):
     url = f"https://api.the-odds-api.com/v4/sports/{SPORT_MAP[sport]}/odds"
-    resp = requests.get(
-        url,
-        params={
-            "apiKey": API_KEY,
-            "regions": "us",
-            "markets": market,
-            "oddsFormat": "american"
-        },
-        timeout=10
-    )
-    return resp.json() if resp.status_code == 200 else []
+    try:
+        resp = requests.get(
+            url,
+            params={
+                "apiKey": API_KEY,
+                "regions": "us",
+                "markets": market,
+                "oddsFormat": "american"
+            },
+            timeout=10
+        )
+        data = resp.json() if resp.status_code == 200 else []
+        if not data:
+            st.warning(f"No game line data returned for {sport} / {market}.")
+        return data
+    except Exception as e:
+        st.error(f"Error fetching game odds: {e}")
+        return []
 
 def normalize_game(raw):
     rows = []
+    if not raw:
+        return pd.DataFrame()
     for g in raw:
         matchup = f"{g.get('away_team')} @ {g.get('home_team')}"
         for b in g.get("bookmakers", []):
@@ -81,24 +90,38 @@ def normalize_game(raw):
 
 def fetch_events(sport):
     url = f"https://api.the-odds-api.com/v4/sports/{SPORT_MAP[sport]}/events"
-    resp = requests.get(url, params={"apiKey": API_KEY, "regions": "us"}, timeout=10)
-    return resp.json() if resp.status_code == 200 else []
+    try:
+        resp = requests.get(url, params={"apiKey": API_KEY, "regions": "us"}, timeout=10)
+        events = resp.json() if resp.status_code == 200 else []
+        if not events:
+            st.warning(f"No upcoming events found for {sport}.")
+        return events
+    except Exception as e:
+        st.error(f"Error fetching events: {e}")
+        return []
 
 def fetch_event_odds(sport, event_id, markets):
     url = f"https://api.the-odds-api.com/v4/sports/{SPORT_MAP[sport]}/events/{event_id}/odds"
-    resp = requests.get(
-        url,
-        params={
-            "apiKey": API_KEY,
-            "regions": "us",
-            "markets": ",".join(markets),
-            "oddsFormat": "american"
-        },
-        timeout=10
-    )
-    return resp.json() if resp.status_code == 200 else []
+    try:
+        resp = requests.get(
+            url,
+            params={
+                "apiKey": API_KEY,
+                "regions": "us",
+                "markets": ",".join(markets),
+                "oddsFormat": "american"
+            },
+            timeout=10
+        )
+        data = resp.json() if resp.status_code == 200 else []
+        if not data:
+            st.warning(f"No player props returned for event ID {event_id}.")
+        return data
+    except Exception as e:
+        st.error(f"Error fetching player props: {e}")
+        return []
 
-def normalize_props(raw, event_id):
+def normalize_props(raw):
     rows = []
     if not raw:
         return pd.DataFrame()
@@ -120,7 +143,6 @@ def normalize_props(raw, event_id):
     return pd.DataFrame(rows)
 
 def best_price(df, group_cols):
-    """Return best odds & book per group"""
     if df.empty:
         return df
     idx = df.groupby(group_cols)["odds"].idxmax()
@@ -130,7 +152,7 @@ def best_price(df, group_cols):
 
 def display_df(df, scope):
     if df.empty:
-        st.warning("No data available.")
+        st.warning("No data available to display.")
         return
     df["implied_prob"] = df["best_odds"].apply(american_to_prob)
     df["model_prob"] = 0.52 if scope == "Game Lines" else 0.55
@@ -157,19 +179,21 @@ scope = st.sidebar.radio("Scope", ["Game Lines", "Player Props"])
 if scope == "Game Lines":
     market = st.sidebar.selectbox("Market", list(GAME_MARKETS.keys()))
     raw = fetch_game_odds(sport, GAME_MARKETS[market])
+    if not raw:
+        st.stop()
     df = normalize_game(raw)
+    if df.empty:
+        st.warning("No normalized game lines available.")
+        st.stop()
     df = best_price(df, ["entity", "market", "side"])
     st.subheader(f"{sport} — {market} (Top Lines by EV)")
     display_df(df, scope)
 
-    # -------------------------
-    # Auto-Ranking Top 2-5 Bets
-    # -------------------------
-    if not df.empty:
-        top_n = min(max(2, int(len(df) * 0.1)), 5)  # ensure 2-5
-        auto_bets = df.sort_values("ev", ascending=False).head(top_n)
-        st.subheader(f"Auto-Ranked Top {top_n} Game Lines by EV")
-        display_df(auto_bets, scope)
+    # Auto-Ranking Top 2-5 Bets by EV
+    top_n = min(max(2, int(len(df) * 0.1)), 5)
+    auto_bets = df.sort_values("ev", ascending=False).head(top_n)
+    st.subheader(f"Auto-Ranked Top {top_n} Game Lines by EV")
+    display_df(auto_bets, scope)
 
 # -------------------------
 # Player Props
@@ -177,7 +201,6 @@ if scope == "Game Lines":
 else:
     events = fetch_events(sport)
     if not events:
-        st.warning("No upcoming events found.")
         st.stop()
 
     event_options = {f"{e['away_team']} @ {e['home_team']}": e["id"] for e in events}
@@ -185,16 +208,18 @@ else:
     event_id = event_options[selected_event]
 
     raw = fetch_event_odds(sport, event_id, PLAYER_PROP_MARKETS)
-    df = normalize_props(raw, event_id)
+    if not raw:
+        st.stop()
+    df = normalize_props(raw)
+    if df.empty:
+        st.warning("No normalized player props available.")
+        st.stop()
     df = best_price(df, ["entity", "market", "prop_side", "line"])
     st.subheader(f"{sport} — Player Props — {selected_event} (Top by EV)")
     display_df(df, scope)
 
-    # -------------------------
-    # Auto-Ranking Top 2-5 Bets
-    # -------------------------
-    if not df.empty:
-        top_n = min(max(2, int(len(df) * 0.1)), 5)  # 2-5 props
-        auto_bets = df.sort_values("ev", ascending=False).head(top_n)
-        st.subheader(f"Auto-Ranked Top {top_n} Player Props by EV")
-        display_df(auto_bets, scope)
+    # Auto-Ranking Top 2-5 Player Props by EV
+    top_n = min(max(2, int(len(df) * 0.1)), 5)
+    auto_bets = df.sort_values("ev", ascending=False).head(top_n)
+    st.subheader(f"Auto-Ranked Top {top_n} Player Props by EV")
+    display_df(auto_bets, scope)

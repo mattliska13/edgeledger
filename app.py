@@ -41,15 +41,13 @@ def american_to_decimal(odds):
 def implied_probability(odds):
     return 1 / american_to_decimal(odds)
 
-def calc_ev(row):
+def calc_ev(decimal_odds, implied_prob):
     """Calculate expected value based on best price."""
-    prob = row["ImpliedProb"]
-    price = row["DecimalOdds"]
-    return round(prob * price - 1, 4)
+    return round(implied_prob * decimal_odds - 1, 4)
 
-def highlight_best(cell, col, df):
+def highlight_best(cell, line, df):
     """Highlight best bookmaker per line/outcome."""
-    subset = df[df["Line"] == col]
+    subset = df[df["Line"] == line]
     if not subset.empty:
         if cell == subset["DecimalOdds"].max():
             return "background-color: #b3ffb3"  # light green
@@ -59,19 +57,15 @@ def highlight_best(cell, col, df):
 # APP SIDEBAR
 # -----------------------
 st.sidebar.title("EdgeLedger — Sports Betting")
-sport_name = st.sidebar.selectbox("Sport", ["NFL", "CFB", "UFC"])
+sport_name = st.sidebar.selectbox("Sport", ["NFL", "CFB"])
 scope = st.sidebar.selectbox("Scope", ["Game Lines", "Player Props"])
 
 player_prop_type = None
-if scope == "Player Props":
-    if sport_name in ["NFL", "CFB"]:
-        player_prop_type = st.sidebar.selectbox(
-            "Player Prop Type",
-            ["passing", "rushing", "receiving", "touchdowns"]
-        )
-    else:
-        st.warning("Player props not available for this sport.")
-        st.stop()
+if scope == "Player Props" and sport_name in ["NFL", "CFB"]:
+    player_prop_type = st.sidebar.selectbox(
+        "Player Prop Type",
+        ["passing", "rushing", "receiving", "touchdowns"]
+    )
 
 # -----------------------
 # MAP SPORT KEYS
@@ -79,7 +73,6 @@ if scope == "Player Props":
 SPORT_KEYS = {
     "NFL": "americanfootball_nfl",
     "CFB": "americanfootball_college_football",
-    "UFC": "mma_ufc"
 }
 sport_key = SPORT_KEYS[sport_name]
 logging.debug(f"Using sport_key={sport_key}, scope={scope}, player_prop_type={player_prop_type}")
@@ -90,9 +83,9 @@ logging.debug(f"Using sport_key={sport_key}, scope={scope}, player_prop_type={pl
 markets = []
 if scope == "Game Lines":
     markets = ["h2h", "spreads", "totals"]
-elif scope == "Player Props":
-    if player_prop_type:
-        markets = [f"player_props:{player_prop_type}"]
+elif scope == "Player Props" and player_prop_type:
+    # FIX: Only include valid player prop market
+    markets = [f"player_props:{player_prop_type}"]
 
 # -----------------------
 # FETCH DATA
@@ -109,22 +102,22 @@ except requests.HTTPError as e:
 # -----------------------
 rows = []
 for event in events:
-    event_name = event.get("home_team") + " vs " + event.get("away_team") if "home_team" in event else event.get("name", "")
-    for market in event.get("bookmakers", []):
-        for outcome in market.get("markets", []):
-            for o in outcome.get("outcomes", []):
-                decimal_odds = american_to_decimal(o["price"])
+    event_name = (
+        f"{event.get('home_team')} vs {event.get('away_team')}"
+        if "home_team" in event else event.get("name", "")
+    )
+    for bookmaker in event.get("bookmakers", []):
+        for market in bookmaker.get("markets", []):
+            for outcome in market.get("outcomes", []):
+                decimal_odds = american_to_decimal(outcome["price"])
                 rows.append({
                     "Event": event_name,
-                    "Bookmaker": market["title"],
-                    "Line": o.get("name", o.get("label", "")),
+                    "Bookmaker": bookmaker["title"],
+                    "Line": outcome.get("name", outcome.get("label", "")),
                     "DecimalOdds": decimal_odds,
-                    "ImpliedProb": implied_probability(o["price"]),
-                    "EV": calc_ev({
-                        "DecimalOdds": decimal_odds,
-                        "ImpliedProb": implied_probability(o["price"])
-                    }),
-                    "Outcome": o["name"]
+                    "ImpliedProb": implied_probability(outcome["price"]),
+                    "EV": calc_ev(decimal_odds, implied_probability(outcome["price"])),
+                    "Outcome": outcome["name"]
                 })
 
 if not rows:

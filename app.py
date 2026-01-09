@@ -4,8 +4,10 @@
 # ✅ NO Kelly / bankroll sizing anywhere
 # ✅ Best price across books + EV (using consensus implied baseline)
 # ✅ Auto-ranked Top 2–5 bets
-# ✅ Robust empty checks + debug logging
+# ✅ Robust empty checks + ALWAYS-visible API diagnostics (fixes “No data” mystery)
+# ✅ Force Refresh button (clears cache + reruns)
 # ✅ No upload dependencies
+# ✅ Fixed triple-quoted markdown (no SyntaxError)
 
 import os
 from datetime import datetime, timezone
@@ -167,6 +169,7 @@ def normalize_game_lines(raw: list) -> pd.DataFrame:
         event_name = f"{away} @ {home}".strip(" @")
         commence = ev.get("commence_time")
 
+        # If bookmakers empty, skip gracefully
         for bk in ev.get("bookmakers", []) or []:
             book = bk.get("title") or bk.get("key")
             for mk in bk.get("markets", []) or []:
@@ -263,15 +266,16 @@ def best_price_table(df: pd.DataFrame, group_cols: list[str], price_col: str = "
 
 
 # -----------------------------
-# API CALLS (SEPARATED)
+# API CALLS (SEPARATED) + DIAGNOSTICS
 # -----------------------------
 @st.cache_data(ttl=120, show_spinner=False)
 def api_discover_markets(sport_key: str):
     url = f"{BASE_URL}/sports/{sport_key}/markets"
     params = {"apiKey": API_KEY}
     ok, payload, status = safe_get(url, params=params)
-    debug = {"url": url, "status": status, "ok": ok, "error": None}
+    debug = {"url": url, "status": status, "ok": ok, "payload_type": type(payload).__name__}
     if ok and isinstance(payload, list):
+        debug["payload_len"] = len(payload)
         return payload, debug
     debug["error"] = payload
     return [], debug
@@ -287,11 +291,24 @@ def api_fetch_game_lines(sport_key: str, markets: list[str]):
         "oddsFormat": ODDS_FORMAT,
     }
     ok, payload, status = safe_get(url, params=params)
-    debug = {"url": url, "status": status, "ok": ok, "error": None, "markets": markets, "sample": None}
+
+    debug = {
+        "url": url,
+        "status": status,
+        "ok": ok,
+        "markets": markets,
+        "payload_type": type(payload).__name__,
+        "payload_len": len(payload) if isinstance(payload, list) else None,
+        "error": None if ok else payload,
+        "sample": payload[0] if ok and isinstance(payload, list) and payload else None,
+    }
+
     if ok and isinstance(payload, list):
-        debug["sample"] = payload[0] if payload else None
-        return normalize_game_lines(payload), debug
-    debug["error"] = payload
+        df = normalize_game_lines(payload)
+        debug["rows_normalized"] = int(df.shape[0])
+        return df, debug
+
+    debug["rows_normalized"] = 0
     return pd.DataFrame(), debug
 
 
@@ -300,11 +317,17 @@ def api_fetch_events(sport_key: str):
     url = f"{BASE_URL}/sports/{sport_key}/events"
     params = {"apiKey": API_KEY}
     ok, payload, status = safe_get(url, params=params)
-    debug = {"url": url, "status": status, "ok": ok, "error": None, "sample": None}
+    debug = {
+        "url": url,
+        "status": status,
+        "ok": ok,
+        "payload_type": type(payload).__name__,
+        "payload_len": len(payload) if isinstance(payload, list) else None,
+        "error": None if ok else payload,
+        "sample": payload[0] if ok and isinstance(payload, list) and payload else None,
+    }
     if ok and isinstance(payload, list):
-        debug["sample"] = payload[0] if payload else None
         return payload, debug
-    debug["error"] = payload
     return [], debug
 
 
@@ -319,10 +342,12 @@ def api_fetch_event_props(sport_key: str, event_id: str, market_key: str):
         "oddsFormat": ODDS_FORMAT,
     }
     ok, payload, status = safe_get(url, params=params)
-    debug = {"url": url, "status": status, "ok": ok, "error": None, "market": market_key}
+    debug = {"url": url, "status": status, "ok": ok, "market": market_key, "error": None if ok else payload}
     if ok and isinstance(payload, dict):
-        return normalize_event_props(payload, market_key), debug
-    debug["error"] = payload
+        df = normalize_event_props(payload, market_key)
+        debug["rows_normalized"] = int(df.shape[0])
+        return df, debug
+    debug["rows_normalized"] = 0
     return pd.DataFrame(), debug
 
 
@@ -335,6 +360,11 @@ sport_key = SPORTS[sport_name]
 
 view = st.sidebar.radio("View", ["Game Lines", "Player Props"], index=0)
 debug_mode = st.sidebar.toggle("Show Debug", value=False)
+
+# 🔄 Force refresh button
+if st.sidebar.button("🔄 Force refresh (clear cache)"):
+    st.cache_data.clear()
+    st.rerun()
 
 st.sidebar.markdown("---")
 top_n = st.sidebar.slider("Auto-rank Top Bets (by EV)", 2, 5, 3, 1)
@@ -359,7 +389,7 @@ if view == "Game Lines":
         default=["Spreads", "Totals", "Moneyline (H2H)"],
     )
 
-    # ✅ Bulletproof default if user unselects everything (fixes "No game line data..." due to empty markets)
+    # ✅ Bulletproof default if user unselects everything
     if not chosen_human:
         chosen = ["h2h", "spreads", "totals"]
     else:
@@ -372,9 +402,16 @@ if view == "Game Lines":
         st.sidebar.write(dbg_lines)
 
     if df_lines.empty:
-        st.warning("No game line data available right now for these settings (or no upcoming games returned).")
-        if debug_mode:
-            st.info("Turn on Debug and check status/error payload in the sidebar.")
+        st.warning("No game line rows were normalized from the API response.")
+        with st.expander("Show API diagnostics (game lines)"):
+            st.write(dbg_lines)
+
+        st.info(
+            "Most common causes:\n"
+            "- No events with odds available for this sport right now\n"
+            "- Events returned but bookmakers list is empty\n"
+            "- API returned an error (rate limit / bad params / plan restriction)"
+        )
     else:
         raw = df_lines.copy()
 
@@ -398,20 +435,16 @@ if view == "Game Lines":
         top = best.head(top_n).copy()
 
         with tabs[0]:
-            st.subheader("🔥 Auto-Ranked Top Bets (Game Lines)  ")
+            st.subheader("🔥 Auto-Ranked Top Bets (Game Lines)")
             st.caption("Best price highlights the single best bookmaker per line. EV uses consensus implied baseline (no external model).")
             st.dataframe(
-                top[
-                    ["Event", "Market", "Outcome", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]
-                ],
+                top[["Event", "Market", "Outcome", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]],
                 use_container_width=True,
             )
 
             st.subheader("Best Price Board (Game Lines)")
             st.dataframe(
-                best[
-                    ["Event", "Market", "Outcome", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]
-                ],
+                best[["Event", "Market", "Outcome", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]],
                 use_container_width=True,
             )
 
@@ -432,7 +465,6 @@ else:
         st.sidebar.markdown("**DEBUG (Market Discovery)**")
         st.sidebar.write(dbg_mk)
 
-    # Build key -> name mapping
     discovered = {}
     for m in markets_list:
         if isinstance(m, dict):
@@ -441,10 +473,11 @@ else:
             if k:
                 discovered[k] = n
 
-    # Filter likely player props
     player_markets = sorted([k for k in discovered.keys() if k.startswith("player_") and k != "player_props"])
     if not player_markets:
         st.warning("No player prop markets discovered for this sport on your plan/books right now.")
+        with st.expander("Show API diagnostics (market discovery)"):
+            st.write(dbg_mk)
         st.stop()
 
     prop_market_key = st.sidebar.selectbox(
@@ -454,7 +487,6 @@ else:
         index=0,
     )
 
-    # Fetch events (separate endpoint)
     events, dbg_ev = api_fetch_events(sport_key)
 
     if debug_mode:
@@ -463,36 +495,39 @@ else:
 
     if not events:
         st.warning("No events returned for this sport right now.")
+        with st.expander("Show API diagnostics (events)"):
+            st.write(dbg_ev)
         st.stop()
 
     all_props = []
-    failures = []
+    prop_diag = {"attempted_events": 0, "events_with_rows": 0, "skipped_empty": 0, "errors": 0}
 
     with st.spinner("Loading player props (event-by-event)…"):
         max_events_to_try = min(25, len(events))
-        tried = 0
-
-        for e in events:
-            if tried >= max_events_to_try:
-                break
+        for e in events[:max_events_to_try]:
             event_id = e.get("id")
             if not event_id:
+                prop_diag["skipped_empty"] += 1
                 continue
-            tried += 1
+            prop_diag["attempted_events"] += 1
 
             df_evprops, dbg_p = api_fetch_event_props(sport_key, event_id, prop_market_key)
+
+            if not dbg_p.get("ok", True):
+                prop_diag["errors"] += 1
+
             if df_evprops.empty:
-                if debug_mode and not dbg_p.get("ok", True):
-                    failures.append(dbg_p)
+                prop_diag["skipped_empty"] += 1
                 continue
+
+            prop_diag["events_with_rows"] += 1
             all_props.append(df_evprops)
 
-    if debug_mode and failures:
-        st.sidebar.markdown("**DEBUG (Prop Failures / Skipped)**")
-        st.sidebar.write(failures[:5])
-
     if not all_props:
-        st.warning("No props returned for that market right now. Try a different market in the dropdown.")
+        st.warning("No props rows were normalized for that market right now.")
+        with st.expander("Show Prop Diagnostics"):
+            st.write(prop_diag)
+        st.info("Try another prop market from the dropdown — availability changes by week/book.")
         st.stop()
 
     raw_props = pd.concat(all_props, ignore_index=True)
@@ -501,24 +536,22 @@ else:
 
     if raw_props.empty:
         st.warning("Props returned, but player fields were empty/unusable.")
+        with st.expander("Show Prop Diagnostics"):
+            st.write(prop_diag)
         st.stop()
 
     raw_props["PosBucket"] = raw_props["Market"].apply(infer_position_bucket)
 
-    # Baseline p_base per player/side/line selection (across books)
     group_cols = ["Event", "Market", "Player", "Side", "Line"]
     cons = raw_props.groupby(group_cols).apply(consensus_true_prob).rename("P_base").reset_index()
 
-    # Best price per selection across books
     best = best_price_table(raw_props, group_cols, "Price")
     best["Best Implied"] = best["Best Price"].apply(american_to_implied)
 
-    # Merge base prob, apply bucket adjustment
     best = best.merge(cons, on=group_cols, how="left")
     best["PosBucket"] = best["Market"].apply(infer_position_bucket)
     best["P_used"] = best.apply(lambda r: apply_bucket_adjustment(r["P_base"], r["PosBucket"], r["Market"]), axis=1)
 
-    # EV
     best["EV"] = (best["P_used"] - best["Best Implied"]) * 100.0
 
     best = best.sort_values("EV", ascending=False)
@@ -528,19 +561,18 @@ else:
         st.subheader(f"🔥 Auto-Ranked Top Bets (Player Props) — {discovered.get(prop_market_key, pretty_market_name(prop_market_key))}")
         st.caption("Best price highlights the single best bookmaker per prop. EV uses consensus implied baseline + small position-bucket adjustment.")
         st.dataframe(
-            top[
-                ["Event", "Player", "Side", "Line", "Best Price", "Best Book", "PosBucket", "P_used", "Best Implied", "EV"]
-            ],
+            top[["Event", "Player", "Side", "Line", "Best Price", "Best Book", "PosBucket", "P_used", "Best Implied", "EV"]],
             use_container_width=True,
         )
 
         st.subheader("Best Price Board (Player Props)")
         st.dataframe(
-            best[
-                ["Event", "Player", "Side", "Line", "Best Price", "Best Book", "PosBucket", "P_used", "Best Implied", "EV"]
-            ],
+            best[["Event", "Player", "Side", "Line", "Best Price", "Best Book", "PosBucket", "P_used", "Best Implied", "EV"]],
             use_container_width=True,
         )
+
+        with st.expander("Show Prop Diagnostics"):
+            st.write(prop_diag)
 
     with tabs[1]:
         st.subheader("All Books (Raw Player Props)")

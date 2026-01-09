@@ -1,135 +1,145 @@
 import streamlit as st
 import requests
 import pandas as pd
+from datetime import datetime
 
-# =====================
-# CONFIGURATION
-# =====================
-API_KEY = st.secrets["ODDS_API_KEY"]  # Load securely
-API_URL = "https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+# ------------------------
+# CONFIG
+# ------------------------
+st.set_page_config(page_title="EdgeLedger — Game Lines + Player Props", layout="wide")
 
-# Supported sports and their valid markets
-SPORT_MARKETS = {
-    "americanfootball_nfl": ["h2h", "spreads", "totals"],
-    "americanfootball_college": ["h2h", "spreads", "totals"],
-    "mma_mixed_martial_arts": ["h2h"]
+# Load API key from secrets
+API_KEY = st.secrets.get("ODDS_API_KEY")
+if not API_KEY:
+    st.error("API key not found. Please add it to Streamlit secrets.")
+    st.stop()
+st.sidebar.write("DEBUG: API_KEY loaded successfully")
+
+# ------------------------
+# UI: Sport + Scope + Player Prop Type
+# ------------------------
+sport_options = {
+    "NFL": "americanfootball_nfl",
+    "CFB": "americanfootball_ncaaf",
+    "UFC": "mma_ufc"
 }
+sport_name = st.sidebar.selectbox("Sport", list(sport_options.keys()))
+sport_key = sport_options[sport_name]
 
-SPORT_DISPLAY = {
-    "americanfootball_nfl": "NFL",
-    "americanfootball_college": "CFB",
-    "mma_mixed_martial_arts": "UFC"
-}
-
-PLAYER_PROP_TYPES = ["passing", "rushing", "receiving", "touchdowns"]
-
-# =====================
-# STREAMLIT UI
-# =====================
-st.set_page_config(page_title="EdgeLedger — Best Bets + EV", layout="wide")
-st.title("EdgeLedger — Game Lines + Player Props (Best Price + EV)")
-
-sport_key = st.selectbox("Sport", list(SPORT_MARKETS.keys()), format_func=lambda x: SPORT_DISPLAY[x])
-scope_options = ["Game Lines"]
-if sport_key in ["americanfootball_nfl", "americanfootball_college"]:
-    scope_options.append("Player Props")
-scope = st.selectbox("Scope", scope_options)
+scope_options = ["Game Lines", "Player Props"]
+scope = st.sidebar.selectbox("Scope", scope_options)
 
 player_prop_type = None
-if scope == "Player Props" and sport_key in ["americanfootball_nfl", "americanfootball_college"]:
-    player_prop_type = st.selectbox("Player Prop Type", PLAYER_PROP_TYPES)
+if scope == "Player Props" and sport_name in ["NFL", "CFB"]:
+    player_prop_type = st.sidebar.selectbox(
+        "Player Prop Type",
+        ["passing", "rushing", "receiving", "touchdowns"]
+    )
 
 st.write(f"DEBUG: Using sport_key={sport_key}, scope={scope}, player_prop_type={player_prop_type}")
 
-# =====================
-# HELPER FUNCTIONS
-# =====================
-def american_to_prob(odds):
-    """Convert American odds to implied probability."""
-    if odds > 0:
-        return 100 / (odds + 100)
-    else:
-        return -odds / (-odds + 100)
-
-def calc_ev(odds, prob):
-    """Calculate expected value (EV)."""
-    return american_to_prob(odds) * (odds if odds > 0 else 100) / 100 - (1 - prob)
-
-def fetch_odds(sport):
-    """Fetch odds from Odds API for valid markets per sport."""
-    markets = SPORT_MARKETS.get(sport, ["h2h"])
+# ------------------------
+# API CALL
+# ------------------------
+def fetch_odds(sport_key, markets):
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {
         "apiKey": API_KEY,
         "regions": "us",
         "markets": ",".join(markets),
         "oddsFormat": "american"
     }
-    url = API_URL.format(sport_key=sport)
     r = requests.get(url, params=params)
-    try:
-        r.raise_for_status()
-        data = r.json()
-        st.write(f"DEBUG: API returned {len(data)} events for {SPORT_DISPLAY[sport]}")
-        return data
-    except requests.HTTPError as e:
-        st.error(f"HTTPError: {e}")
-        st.stop()
+    r.raise_for_status()
+    return r.json()
 
-def normalize_bookmakers(event):
-    """Flatten bookmaker data into a DataFrame with EV."""
+# Determine which markets to request
+markets = []
+if scope == "Game Lines":
+    markets = ["h2h", "spreads", "totals"]
+elif scope == "Player Props":
+    markets = ["player_props"]
+
+st.write(f"DEBUG: Requesting markets: {markets}")
+
+try:
+    data = fetch_odds(sport_key, markets)
+except requests.HTTPError as e:
+    st.error(f"API request failed: {e}")
+    st.stop()
+
+st.write(f"DEBUG: API returned {len(data)} events for {sport_name}")
+
+# ------------------------
+# HELPER FUNCTIONS
+# ------------------------
+def american_to_prob(odds):
+    """Convert American odds to true implied probability"""
+    if odds > 0:
+        return 100 / (odds + 100)
+    else:
+        return -odds / (-odds + 100)
+
+def normalize_bookmakers(event, scope, player_prop_type=None):
     rows = []
     for book in event.get("bookmakers", []):
         for market in book.get("markets", []):
+            # Skip irrelevant player props
+            if scope == "Player Props" and player_prop_type:
+                if player_prop_type not in market.get("key", ""):
+                    continue
             for outcome in market.get("outcomes", []):
+                price = outcome.get("price")
+                prob = american_to_prob(price) if price else None
                 row = {
-                    "event_id": event["id"],
-                    "sport": event["sport_title"],
-                    "commence_time": event["commence_time"],
-                    "home_team": event.get("home_team"),
-                    "away_team": event.get("away_team"),
-                    "bookmaker": book["title"],
-                    "market": market["key"],
-                    "outcome": outcome["name"],
-                    "price": outcome["price"],
-                    "point": outcome.get("point", None)
+                    "Event": f"{event.get('away_team')} @ {event.get('home_team')}",
+                    "Commence": event.get("commence_time"),
+                    "Market": market.get("key"),
+                    "Outcome": outcome.get("name"),
+                    "Price": price,
+                    "Implied Prob": prob,
+                    "Bookmaker": book.get("title")
                 }
-                # Implied probability and EV
-                prob = american_to_prob(outcome["price"])
-                row["implied_prob"] = prob
-                row["ev"] = calc_ev(outcome["price"], prob)
                 rows.append(row)
-    return pd.DataFrame(rows)
+    return rows
 
-# =====================
-# FETCH & PROCESS DATA
-# =====================
-events = fetch_odds(sport_key)
-all_rows = pd.concat([normalize_bookmakers(ev) for ev in events], ignore_index=True)
-if all_rows.empty:
-    st.warning("No normalized data available for this selection.")
-else:
-    # =====================
-    # BEST PRICE / EV HIGHLIGHT
-    # =====================
-    best_ev_idx = all_rows.groupby(["event_id", "market", "outcome"])["ev"].idxmax()
-    all_rows["best_ev"] = False
-    all_rows.loc[best_ev_idx, "best_ev"] = True
+# ------------------------
+# NORMALIZE DATA
+# ------------------------
+all_rows = []
+for event in data:
+    rows = normalize_bookmakers(event, scope, player_prop_type)
+    if rows:
+        all_rows.extend(rows)
 
-    # =====================
-    # TOP 2–5 BETS AUTO-RANK
-    # =====================
-    top_bets = all_rows.sort_values("ev", ascending=False).head(5)
-    
-    # =====================
-    # DISPLAY TABLE
-    # =====================
-    def highlight_best(s):
-        return ["background-color: lightgreen" if v else "" for v in s]
+if not all_rows:
+    st.warning("No normalized data available for selected filters.")
+    st.stop()
 
-    st.subheader("Top EV Bets")
-    st.dataframe(top_bets.style.apply(highlight_best, subset=["best_ev"]))
+df = pd.DataFrame(all_rows)
 
-    st.subheader("All Available Lines")
-    st.dataframe(all_rows.style.apply(highlight_best, subset=["best_ev"]))
+# ------------------------
+# BEST BOOKMAKER HIGHLIGHT
+# ------------------------
+def highlight_best(row, df):
+    """Mark best bookmaker per outcome (highest price for positive EV)"""
+    subset = df[(df["Event"] == row["Event"]) & (df["Outcome"] == row["Outcome"])]
+    if row["Price"] == subset["Price"].max():
+        return "background-color: #b6fcd5"  # green highlight
+    return ""
 
-st.write("DEBUG: Data loaded successfully")
+# ------------------------
+# CALCULATE EXPECTED VALUE
+# ------------------------
+df["EV"] = df["Implied Prob"] * df["Price"] - (1 - df["Implied Prob"])
+df_sorted = df.sort_values("EV", ascending=False)
+
+# Auto-rank top 2–5 bets
+top_bets = df_sorted.head(5)
+
+# ------------------------
+# DISPLAY
+# ------------------------
+st.subheader(f"EdgeLedger — {scope} ({sport_name})")
+st.write("Top Bets Ranked by EV")
+st.dataframe(top_bets.style.applymap(lambda x: highlight_best(x, df), subset=["Price"]))

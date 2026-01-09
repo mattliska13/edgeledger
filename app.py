@@ -1,20 +1,24 @@
-# app.py — EdgeLedger Dashboard (NFL / CFB)
-# ✅ Uses your provided API key (hard-coded) for now
-# ✅ Game Lines and Player Props use completely separate API calls (prevents cross-talk + 422)
-# ✅ Game lines: /sports/{sport_key}/odds (markets=h2h,spreads,totals)
-# ✅ Player props: /sports/{sport_key}/events -> /events/{event_id}/odds (ONE market per request)
-# ✅ Dynamic prop market discovery (/sports/{sport_key}/markets) to populate dropdown
-# ✅ Best price across books + EV (consensus implied baseline)
-# ✅ Auto-ranked Top 2–5 bets
-# ✅ Robust empty checks + ALWAYS shows diagnostics when empty
-# ✅ Force refresh (clears cache)
+# app.py — EdgeLedger Dashboard (NFL / CFB / CBB)
+# ✅ The Odds API, optimized for free/limited credits:
+#   - Click-to-load (no automatic API calls on reruns)
+#   - Aggressive caching
+#   - Snapshot fallback (keeps site operational when quota is exhausted)
+# ✅ Separate API calls:
+#   - Game Lines: /sports/{sport_key}/odds?markets=h2h,spreads,totals
+#   - Player Props: /sports/{sport_key}/events then /events/{event_id}/odds (ONE market per request)
+# ✅ Best price + EV + Auto-ranked Top 2–5
+# ✅ Dynamic prop market discovery (cached + snapshot)
 # ✅ No uploads, no Kelly, deploy-ready
+
+import json
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from datetime import datetime, timezone
 
 # -----------------------------
 # PAGE / THEME
@@ -47,14 +51,16 @@ st.title("🎯 EdgeLedger Dashboard")
 # API CONFIG (YOUR KEY)
 # -----------------------------
 API_KEY = "6a5d08e7c2407da6fb95b86ad9619bf0"  # <-- Provided key
+
 BASE_URL = "https://api.the-odds-api.com/v4"
 REGION = "us"
 ODDS_FORMAT = "american"
-HEADERS = {"User-Agent": "EdgeLedgerDashboard/2.0"}
+HEADERS = {"User-Agent": "EdgeLedgerDashboard/3.0"}
 
 SPORTS = {
     "NFL": "americanfootball_nfl",
     "CFB": "americanfootball_ncaaf",
+    "CBB": "basketball_ncaab",
 }
 
 GAME_MARKETS = {
@@ -67,28 +73,72 @@ GAME_MARKETS = {
 FALLBACK_BOOKMAKERS = ["draftkings", "fanduel", "betmgm", "pinnacle", "circa"]
 
 # -----------------------------
+# CREDIT-FRIENDLY SETTINGS
+# -----------------------------
+GAME_LINES_TTL = 15 * 60    # 15 minutes
+EVENTS_TTL = 30 * 60        # 30 minutes
+PROPS_TTL = 15 * 60         # 15 minutes
+MARKETS_TTL = 24 * 60 * 60  # 24 hours
+
+# Require click to fetch from API (prevents rerun credit burn)
+REQUIRE_CLICK_TO_LOAD = True
+
+# Snapshot folder (works on Streamlit Cloud; may reset on redeploy, but keeps app operational)
+SNAP_DIR = ".snapshots"
+os.makedirs(SNAP_DIR, exist_ok=True)
+
+# -----------------------------
 # HELPERS
 # -----------------------------
-def now_utc():
+def now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def safe_get(url: str, params: dict, timeout: int = 20):
-    """HTTP GET with robust error handling; returns (ok, payload, status_code)."""
+def snap_path(name: str) -> str:
+    return os.path.join(SNAP_DIR, name)
+
+
+def save_snapshot_json(path: str, data: Any) -> None:
     try:
-        r = requests.get(url, headers=HEADERS, params=params, timeout=timeout)
-        if r.status_code == 200:
-            return True, r.json(), 200
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def load_snapshot_json(path: str) -> Any:
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_snapshot_df(path: str, df: pd.DataFrame) -> None:
+    try:
+        df.to_parquet(path, index=False)
+    except Exception:
         try:
-            payload = r.json()
+            df.to_csv(path.replace(".parquet", ".csv"), index=False)
         except Exception:
-            payload = {"message": r.text}
-        return False, payload, r.status_code
-    except Exception as e:
-        return False, {"message": str(e)}, -1
+            pass
 
 
-def american_to_implied(odds):
+def load_snapshot_df(path: str) -> pd.DataFrame:
+    try:
+        if os.path.exists(path):
+            return pd.read_parquet(path)
+        csv_path = path.replace(".parquet", ".csv")
+        if os.path.exists(csv_path):
+            return pd.read_csv(csv_path)
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def american_to_implied(odds) -> float:
     try:
         o = float(odds)
     except Exception:
@@ -99,7 +149,6 @@ def american_to_implied(odds):
 
 
 def consensus_true_prob(df_group: pd.DataFrame) -> float:
-    """Baseline probability from market (average implied across books)."""
     vals = df_group["Implied"].dropna().values
     if len(vals) == 0:
         return np.nan
@@ -110,7 +159,7 @@ def pretty_market_name(k: str) -> str:
     return (k or "").replace("_", " ").title()
 
 
-def best_price_table(df: pd.DataFrame, group_cols: list[str], price_col: str = "Price") -> pd.DataFrame:
+def best_price_table(df: pd.DataFrame, group_cols: List[str], price_col: str = "Price") -> pd.DataFrame:
     """
     Best price across books for American odds = numeric max
     (+200 > +180, -105 > -115)
@@ -121,6 +170,32 @@ def best_price_table(df: pd.DataFrame, group_cols: list[str], price_col: str = "
     best = df.loc[idx].copy()
     best = best.rename(columns={price_col: "Best Price", "Book": "Best Book"})
     return best.reset_index(drop=True)
+
+
+def is_out_of_credits(status: int, payload: Any) -> bool:
+    if status != 401 or not isinstance(payload, dict):
+        return False
+    return payload.get("error_code") in ("OUT_OF_USAGE_CREDITS", "OUT_OF_CREDITS")
+
+
+def safe_get(url: str, params: dict, timeout: int = 20) -> Tuple[bool, Any, int]:
+    """HTTP GET with robust error handling; returns (ok, payload, status_code)."""
+    try:
+        r = requests.get(url, headers=HEADERS, params=params, timeout=timeout)
+        status = r.status_code
+        try:
+            payload = r.json()
+        except Exception:
+            payload = {"message": r.text}
+
+        if status == 200:
+            return True, payload, status
+
+        # Explicitly preserve quota payload for UI handling
+        return False, payload, status
+
+    except Exception as e:
+        return False, {"message": str(e)}, -1
 
 
 # -----------------------------
@@ -168,9 +243,7 @@ def normalize_game_lines(raw: list) -> pd.DataFrame:
 
 
 def normalize_event_props(event_odds_json: dict, market_key: str) -> pd.DataFrame:
-    """
-    Normalizes /events/{event_id}/odds response for ONE prop market into player-based rows.
-    """
+    """Normalize /events/{event_id}/odds response for ONE prop market into player-based rows."""
     if not isinstance(event_odds_json, dict):
         return pd.DataFrame()
 
@@ -185,6 +258,7 @@ def normalize_event_props(event_odds_json: dict, market_key: str) -> pd.DataFram
         for mk in bk.get("markets", []) or []:
             if mk.get("key") != market_key:
                 continue
+
             for out in mk.get("outcomes", []) or []:
                 player = (
                     out.get("description")
@@ -222,13 +296,14 @@ def normalize_event_props(event_odds_json: dict, market_key: str) -> pd.DataFram
 
 
 # -----------------------------
-# API CALLS (SEPARATED)
+# API CALLS (SEPARATED + CACHED)
 # -----------------------------
-@st.cache_data(ttl=120, show_spinner=False)
-def api_discover_markets(sport_key: str):
+@st.cache_data(ttl=MARKETS_TTL, show_spinner=False)
+def api_discover_markets(sport_key: str) -> Tuple[List[dict], dict]:
     url = f"{BASE_URL}/sports/{sport_key}/markets"
     params = {"apiKey": API_KEY}
     ok, payload, status = safe_get(url, params=params)
+
     dbg = {
         "endpoint": "markets",
         "url": url,
@@ -237,13 +312,12 @@ def api_discover_markets(sport_key: str):
         "payload_type": type(payload).__name__,
         "payload_len": len(payload) if isinstance(payload, list) else None,
         "error": None if ok else payload,
-        "sample": payload[0] if ok and isinstance(payload, list) and payload else None,
     }
-    return payload if ok and isinstance(payload, list) else [], dbg
+    return (payload if ok and isinstance(payload, list) else []), dbg
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def api_fetch_game_lines_once(sport_key: str, markets: list[str], bookmakers: list[str] | None = None):
+@st.cache_data(ttl=GAME_LINES_TTL, show_spinner=False)
+def api_fetch_game_lines_once(sport_key: str, markets: List[str], bookmakers: List[str] | None = None):
     url = f"{BASE_URL}/sports/{sport_key}/odds"
     params = {
         "apiKey": API_KEY,
@@ -265,7 +339,7 @@ def api_fetch_game_lines_once(sport_key: str, markets: list[str], bookmakers: li
         "payload_type": type(payload).__name__,
         "payload_len": len(payload) if isinstance(payload, list) else None,
         "error": None if ok else payload,
-        "sample": payload[0] if ok and isinstance(payload, list) and payload else None,
+        "rows_normalized": 0,
     }
 
     if ok and isinstance(payload, list):
@@ -273,11 +347,10 @@ def api_fetch_game_lines_once(sport_key: str, markets: list[str], bookmakers: li
         dbg["rows_normalized"] = int(df.shape[0])
         return df, dbg
 
-    dbg["rows_normalized"] = 0
     return pd.DataFrame(), dbg
 
 
-def api_fetch_game_lines_with_fallback(sport_key: str, markets: list[str]):
+def api_fetch_game_lines_with_fallback(sport_key: str, markets: List[str]):
     df1, dbg1 = api_fetch_game_lines_once(sport_key, markets, bookmakers=None)
     if not df1.empty:
         dbg1["fallback_used"] = False
@@ -289,7 +362,7 @@ def api_fetch_game_lines_with_fallback(sport_key: str, markets: list[str]):
     return df2, dbg2
 
 
-@st.cache_data(ttl=90, show_spinner=False)
+@st.cache_data(ttl=EVENTS_TTL, show_spinner=False)
 def api_fetch_events(sport_key: str):
     url = f"{BASE_URL}/sports/{sport_key}/events"
     params = {"apiKey": API_KEY}
@@ -302,18 +375,17 @@ def api_fetch_events(sport_key: str):
         "payload_type": type(payload).__name__,
         "payload_len": len(payload) if isinstance(payload, list) else None,
         "error": None if ok else payload,
-        "sample": payload[0] if ok and isinstance(payload, list) and payload else None,
     }
-    return payload if ok and isinstance(payload, list) else [], dbg
+    return (payload if ok and isinstance(payload, list) else []), dbg
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=PROPS_TTL, show_spinner=False)
 def api_fetch_event_props(sport_key: str, event_id: str, market_key: str):
     url = f"{BASE_URL}/sports/{sport_key}/events/{event_id}/odds"
     params = {
         "apiKey": API_KEY,
         "regions": REGION,
-        "markets": market_key,  # ONE market per call
+        "markets": market_key,  # ONE market per call (prevents 422)
         "oddsFormat": ODDS_FORMAT,
     }
     ok, payload, status = safe_get(url, params=params)
@@ -325,12 +397,12 @@ def api_fetch_event_props(sport_key: str, event_id: str, market_key: str):
         "market": market_key,
         "payload_type": type(payload).__name__,
         "error": None if ok else payload,
+        "rows_normalized": 0,
     }
     if ok and isinstance(payload, dict):
         df = normalize_event_props(payload, market_key)
         dbg["rows_normalized"] = int(df.shape[0])
         return df, dbg
-    dbg["rows_normalized"] = 0
     return pd.DataFrame(), dbg
 
 
@@ -344,12 +416,17 @@ sport_key = SPORTS[sport_name]
 view = st.sidebar.radio("View", ["Game Lines", "Player Props"], index=0)
 debug_mode = st.sidebar.toggle("Show Debug", value=False)
 
+st.sidebar.markdown("---")
+top_n = st.sidebar.slider("Auto-rank Top Bets (by EV)", 2, 5, 3, 1)
+
+# Click-to-load prevents rerun credit burn
+load_clicked = True
+if REQUIRE_CLICK_TO_LOAD:
+    load_clicked = st.sidebar.button("📥 Load / Refresh Data")
+
 if st.sidebar.button("🔄 Force refresh (clear cache)"):
     st.cache_data.clear()
     st.rerun()
-
-st.sidebar.markdown("---")
-top_n = st.sidebar.slider("Auto-rank Top Bets (by EV)", 2, 5, 3, 1)
 
 # -----------------------------
 # HEADER METRICS
@@ -361,8 +438,13 @@ c3.metric("Mode", view)
 
 tabs = st.tabs(["Dashboard", "All Books (Raw)", "Diagnostics / Help"])
 
+# If not clicked, show snapshots if available (operational site even without credits)
+if REQUIRE_CLICK_TO_LOAD and not load_clicked:
+    st.info("Click **📥 Load / Refresh Data** in the sidebar to fetch new odds (prevents burning credits).")
+    st.caption("Showing last saved snapshot if available.")
+
 # -----------------------------
-# GAME LINES (separate API call)
+# GAME LINES (separate API call + snapshot fallback)
 # -----------------------------
 if view == "Game Lines":
     chosen_human = st.sidebar.multiselect(
@@ -372,16 +454,44 @@ if view == "Game Lines":
     )
     chosen = [GAME_MARKETS[x] for x in chosen_human] if chosen_human else ["h2h", "spreads", "totals"]
 
-    df_lines, dbg_lines = api_fetch_game_lines_with_fallback(sport_key, chosen)
+    snap_df_path = snap_path(f"lines_{sport_key}.parquet")
+    snap_dbg_path = snap_path(f"lines_dbg_{sport_key}.json")
 
+    df_lines = pd.DataFrame()
+    dbg_lines: Dict[str, Any] = {}
+
+    # If user clicked (or click not required), attempt API fetch
+    if (not REQUIRE_CLICK_TO_LOAD) or load_clicked:
+        df_lines, dbg_lines = api_fetch_game_lines_with_fallback(sport_key, chosen)
+
+        # If out of credits, fallback to snapshot immediately
+        if (not dbg_lines.get("ok", True)) and is_out_of_credits(dbg_lines.get("status", 0), dbg_lines.get("error")):
+            st.warning("🚫 Odds API credits exhausted (OUT_OF_USAGE_CREDITS). Showing last snapshot if available.")
+            df_lines = load_snapshot_df(snap_df_path)
+            old_dbg = load_snapshot_json(snap_dbg_path) or {}
+            dbg_lines["snapshot_used"] = True
+            dbg_lines["snapshot_dbg"] = old_dbg
+
+        # If we got fresh rows, snapshot them
+        if not df_lines.empty:
+            save_snapshot_df(snap_df_path, df_lines)
+            save_snapshot_json(snap_dbg_path, dbg_lines)
+
+    # If no API fetch happened (no click) OR fetch yielded nothing, show snapshot
     if df_lines.empty:
-        st.warning("No game line rows were normalized from the API response.")
-        with st.expander("Show API diagnostics (game lines)"):
+        df_lines = load_snapshot_df(snap_df_path)
+        if not dbg_lines:
+            dbg_lines = load_snapshot_json(snap_dbg_path) or {}
+            dbg_lines["snapshot_used"] = True
+
+    # Final empty handling
+    if df_lines.empty:
+        st.warning("No game line data available right now (and no saved snapshot yet).")
+        with st.expander("Diagnostics (game lines)"):
             st.write(dbg_lines)
         st.stop()
 
     raw = df_lines.copy()
-
     best = best_price_table(raw, ["Event", "Market", "Outcome", "Line"], "Price")
     best["Best Implied"] = best["Best Price"].apply(american_to_implied)
 
@@ -395,15 +505,17 @@ if view == "Game Lines":
     best["EV"] = (best["P_true"] - best["Best Implied"]) * 100.0
 
     best = best.sort_values("EV", ascending=False)
-    top = best.head(top_n)
+    top = best.head(top_n).copy()
+    top.insert(0, "⭐", "⭐")  # highlight that these are top-ranked
 
     with tabs[0]:
         st.subheader("🔥 Auto-Ranked Top Bets (Game Lines)")
-        st.caption("Best price = best bookmaker for that exact line/outcome. EV uses consensus implied baseline.")
+        st.caption("Best Book = absolute best bookmaker for that exact line/outcome. EV uses market consensus implied baseline.")
         st.dataframe(
-            top[["Event", "Market", "Outcome", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]],
+            top[["⭐", "Event", "Market", "Outcome", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]],
             use_container_width=True,
         )
+
         st.subheader("Best Price Board (Game Lines)")
         st.dataframe(
             best[["Event", "Market", "Outcome", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]],
@@ -414,16 +526,37 @@ if view == "Game Lines":
         st.subheader("All Books (Raw Game Lines)")
         st.dataframe(raw[["Event", "Market", "Outcome", "Line", "Price", "Book", "Implied"]], use_container_width=True)
 
-    if debug_mode:
-        with tabs[2]:
-            st.subheader("Diagnostics (Game Lines)")
-            st.write(dbg_lines)
+    with tabs[2]:
+        st.subheader("Diagnostics (Game Lines)")
+        st.write(dbg_lines)
 
 # -----------------------------
-# PLAYER PROPS (separate API calls: markets -> events -> event odds)
+# PLAYER PROPS (separate API flow + snapshot fallback)
 # -----------------------------
 else:
-    markets_list, dbg_mk = api_discover_markets(sport_key)
+    snap_best_path = snap_path(f"props_best_{sport_key}.parquet")
+    snap_raw_path = snap_path(f"props_raw_{sport_key}.parquet")
+    snap_dbg_path = snap_path(f"props_dbg_{sport_key}.json")
+    snap_markets_path = snap_path(f"markets_{sport_key}.json")
+
+    markets_list: List[dict] = []
+    dbg_mk: Dict[str, Any] = {}
+
+    # Discover markets (cached); if out of credits, use saved snapshot
+    if (not REQUIRE_CLICK_TO_LOAD) or load_clicked:
+        markets_list, dbg_mk = api_discover_markets(sport_key)
+
+        if (not dbg_mk.get("ok", True)) and is_out_of_credits(dbg_mk.get("status", 0), dbg_mk.get("error")):
+            st.warning("🚫 Credits exhausted during market discovery. Using last saved markets list if available.")
+            markets_list = load_snapshot_json(snap_markets_path) or []
+            dbg_mk["snapshot_used"] = True
+
+        if markets_list:
+            save_snapshot_json(snap_markets_path, markets_list)
+
+    # If no click / empty, use saved markets
+    if not markets_list:
+        markets_list = load_snapshot_json(snap_markets_path) or []
 
     discovered = {}
     for m in markets_list:
@@ -435,11 +568,13 @@ else:
 
     player_markets = sorted([k for k in discovered.keys() if k.startswith("player_") and k != "player_props"])
     if not player_markets:
-        st.warning("No player prop markets discovered for this sport on your plan/books right now.")
-        with st.expander("Show API diagnostics (market discovery)"):
+        st.warning("No player prop markets are available (and no saved snapshot yet).")
+        with tabs[2]:
+            st.subheader("Diagnostics (Market Discovery)")
             st.write(dbg_mk)
         st.stop()
 
+    # Dropdown for prop market
     prop_market_key = st.sidebar.selectbox(
         "Player Prop Market (auto-discovered)",
         options=player_markets,
@@ -447,10 +582,88 @@ else:
         index=0,
     )
 
+    # If no click, show snapshot tables if available
+    if REQUIRE_CLICK_TO_LOAD and not load_clicked:
+        best_snap = load_snapshot_df(snap_best_path)
+        raw_snap = load_snapshot_df(snap_raw_path)
+        dbg_snap = load_snapshot_json(snap_dbg_path) or {"snapshot_used": True}
+
+        if best_snap.empty:
+            st.info("Click **📥 Load / Refresh Data** to fetch props. No saved snapshot yet for props.")
+            st.stop()
+
+        top = best_snap.sort_values("EV", ascending=False).head(top_n).copy()
+        top.insert(0, "⭐", "⭐")
+
+        with tabs[0]:
+            st.subheader(f"🔥 Auto-Ranked Top Bets (Player Props) — {discovered.get(prop_market_key)}")
+            st.dataframe(
+                top[["⭐", "Event", "Player", "Side", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]],
+                use_container_width=True,
+            )
+            st.subheader("Best Price Board (Player Props)")
+            st.dataframe(
+                best_snap[["Event", "Player", "Side", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]],
+                use_container_width=True,
+            )
+
+        with tabs[1]:
+            st.subheader("All Books (Raw Player Props)")
+            st.dataframe(
+                raw_snap[["Event", "Market", "Player", "Side", "Line", "Price", "Book", "Implied"]],
+                use_container_width=True,
+            )
+
+        with tabs[2]:
+            st.subheader("Diagnostics (Player Props)")
+            st.write(dbg_snap)
+
+        st.stop()
+
+    # Otherwise, fetch props using separate calls: events -> event odds
     events, dbg_ev = api_fetch_events(sport_key)
+
+    # Handle out-of-credits
+    if (not dbg_ev.get("ok", True)) and is_out_of_credits(dbg_ev.get("status", 0), dbg_ev.get("error")):
+        st.warning("🚫 Credits exhausted while loading events. Showing last props snapshot if available.")
+        best_snap = load_snapshot_df(snap_best_path)
+        raw_snap = load_snapshot_df(snap_raw_path)
+        dbg_snap = load_snapshot_json(snap_dbg_path) or {}
+        dbg_snap["snapshot_used"] = True
+
+        if best_snap.empty:
+            st.info("No saved props snapshot exists yet. Upgrade/wait for quota reset then click Load.")
+            st.stop()
+
+        top = best_snap.sort_values("EV", ascending=False).head(top_n).copy()
+        top.insert(0, "⭐", "⭐")
+
+        with tabs[0]:
+            st.subheader(f"🔥 Auto-Ranked Top Bets (Player Props) — {discovered.get(prop_market_key)}")
+            st.dataframe(
+                top[["⭐", "Event", "Player", "Side", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]],
+                use_container_width=True,
+            )
+            st.subheader("Best Price Board (Player Props)")
+            st.dataframe(
+                best_snap[["Event", "Player", "Side", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]],
+                use_container_width=True,
+            )
+        with tabs[1]:
+            st.subheader("All Books (Raw Player Props)")
+            st.dataframe(
+                raw_snap[["Event", "Market", "Player", "Side", "Line", "Price", "Book", "Implied"]],
+                use_container_width=True,
+            )
+        with tabs[2]:
+            st.subheader("Diagnostics (Player Props)")
+            st.write({"events_dbg": dbg_ev, "snapshot_dbg": dbg_snap})
+        st.stop()
+
     if not events:
         st.warning("No events returned for this sport right now.")
-        with st.expander("Show API diagnostics (events)"):
+        with tabs[2]:
+            st.subheader("Diagnostics (Events)")
             st.write(dbg_ev)
         st.stop()
 
@@ -458,17 +671,21 @@ else:
     prop_diag = {"attempted_events": 0, "events_with_rows": 0, "skipped_empty": 0, "errors": 0}
 
     with st.spinner("Loading player props (event-by-event)…"):
-        max_events_to_try = min(25, len(events))
+        max_events_to_try = min(20, len(events))  # reduce calls to protect credits
         for e in events[:max_events_to_try]:
             event_id = e.get("id")
             if not event_id:
                 prop_diag["skipped_empty"] += 1
                 continue
-            prop_diag["attempted_events"] += 1
 
+            prop_diag["attempted_events"] += 1
             df_evprops, dbg_p = api_fetch_event_props(sport_key, event_id, prop_market_key)
+
             if not dbg_p.get("ok", True):
                 prop_diag["errors"] += 1
+                # if out of credits mid-loop, stop early and use what we have
+                if is_out_of_credits(dbg_p.get("status", 0), dbg_p.get("error")):
+                    break
 
             if df_evprops.empty:
                 prop_diag["skipped_empty"] += 1
@@ -479,9 +696,10 @@ else:
 
     if not all_props:
         st.warning("No props rows were normalized for that market right now.")
-        with st.expander("Show Prop Diagnostics"):
-            st.write(prop_diag)
-        st.info("Try another market from the dropdown (availability varies by week/book).")
+        st.info("Try another market from the dropdown (availability varies by sport/date/book).")
+        with tabs[2]:
+            st.subheader("Diagnostics (Props)")
+            st.write({"events_dbg": dbg_ev, "prop_diag": prop_diag})
         st.stop()
 
     raw_props = pd.concat(all_props, ignore_index=True)
@@ -489,21 +707,27 @@ else:
     raw_props = raw_props[raw_props["Player"].str.len() > 0].copy()
 
     group_cols = ["Event", "Market", "Player", "Side", "Line"]
-    cons = raw_props.groupby(group_cols).apply(consensus_true_prob).rename("P_true").reset_index()
 
+    cons = raw_props.groupby(group_cols).apply(consensus_true_prob).rename("P_true").reset_index()
     best = best_price_table(raw_props, group_cols, "Price")
     best["Best Implied"] = best["Best Price"].apply(american_to_implied)
     best = best.merge(cons, on=group_cols, how="left")
-
     best["EV"] = (best["P_true"] - best["Best Implied"]) * 100.0
     best = best.sort_values("EV", ascending=False)
-    top = best.head(top_n)
+
+    # Save snapshots (operational fallback)
+    save_snapshot_df(snap_best_path, best)
+    save_snapshot_df(snap_raw_path, raw_props)
+    save_snapshot_json(snap_dbg_path, {"events_dbg": dbg_ev, "prop_diag": prop_diag, "market": prop_market_key})
+
+    top = best.head(top_n).copy()
+    top.insert(0, "⭐", "⭐")
 
     with tabs[0]:
-        st.subheader(f"🔥 Auto-Ranked Top Bets (Player Props) — {discovered.get(prop_market_key, pretty_market_name(prop_market_key))}")
-        st.caption("Best price = best bookmaker per player/side/line. EV uses consensus implied baseline.")
+        st.subheader(f"🔥 Auto-Ranked Top Bets (Player Props) — {discovered.get(prop_market_key)}")
+        st.caption("Best Book = absolute best bookmaker per player/side/line. EV uses market consensus implied baseline.")
         st.dataframe(
-            top[["Event", "Player", "Side", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]],
+            top[["⭐", "Event", "Player", "Side", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]],
             use_container_width=True,
         )
         st.subheader("Best Price Board (Player Props)")
@@ -511,7 +735,7 @@ else:
             best[["Event", "Player", "Side", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]],
             use_container_width=True,
         )
-        with st.expander("Show Prop Diagnostics"):
+        with st.expander("Prop Diagnostics"):
             st.write(prop_diag)
 
     with tabs[1]:
@@ -521,29 +745,28 @@ else:
             use_container_width=True,
         )
 
-    if debug_mode:
-        with tabs[2]:
-            st.subheader("Diagnostics (Player Props)")
-            st.write({"market_discovery": dbg_mk, "events": dbg_ev, "prop_diag": prop_diag})
+    with tabs[2]:
+        st.subheader("Diagnostics (Player Props)")
+        st.write({"market_discovery_dbg": dbg_mk, "events_dbg": dbg_ev, "prop_diag": prop_diag})
 
 # -----------------------------
-# DEPLOY HELP
+# HELP / DEPLOY
 # -----------------------------
 with tabs[2]:
     st.subheader("Deploy Notes (Operational Site)")
     st.markdown(
         """
-**Streamlit Cloud:**  
-1) Push this `app.py` to GitHub  
-2) Streamlit Cloud → New app → Select repo → Main file: `app.py`  
+### Streamlit Cloud deploy
+1) Push `app.py` to GitHub  
+2) Streamlit Cloud → **New app** → select repo → main file: `app.py`  
 3) Deploy
 
-**If Game Lines show empty:** Open “Show API diagnostics (game lines)” and look at:
-- `status` (200 vs 401/429)
-- `payload_len`
-- `rows_normalized`
-- `fallback_used`
+### Why this stays operational
+- The app only fetches data when you click **📥 Load / Refresh Data**
+- It caches results aggressively
+- It saves snapshots and shows the last snapshot when credits are exhausted
 
-**If Props show empty:** Try a different prop market — availability varies by books + sport + date.
+### If you see OUT_OF_USAGE_CREDITS
+Upgrade your Odds API plan or wait for quota reset, then click **Load / Refresh Data**.
 """
     )

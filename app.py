@@ -42,7 +42,6 @@ def implied_probability(odds):
     return 1 / american_to_decimal(odds)
 
 def calc_ev(decimal_odds, implied_prob):
-    """Calculate expected value based on best price."""
     return round(implied_prob * decimal_odds - 1, 4)
 
 def highlight_best(cell, line, df):
@@ -83,9 +82,8 @@ logging.debug(f"Using sport_key={sport_key}, scope={scope}, player_prop_type={pl
 markets = []
 if scope == "Game Lines":
     markets = ["h2h", "spreads", "totals"]
-elif scope == "Player Props" and player_prop_type:
-    # FIX: Only include valid player prop market
-    markets = [f"player_props:{player_prop_type}"]
+elif scope == "Player Props":
+    markets = ["player_props"]  # FIX: Always fetch player_props as market
 
 # -----------------------
 # FETCH DATA
@@ -108,7 +106,12 @@ for event in events:
     )
     for bookmaker in event.get("bookmakers", []):
         for market in bookmaker.get("markets", []):
+            # FILTER player props outcomes if applicable
             for outcome in market.get("outcomes", []):
+                if scope == "Player Props" and player_prop_type:
+                    # Only include the selected prop type
+                    if player_prop_type not in outcome["name"].lower():
+                        continue
                 decimal_odds = american_to_decimal(outcome["price"])
                 rows.append({
                     "Event": event_name,

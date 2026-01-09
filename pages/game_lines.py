@@ -107,11 +107,17 @@ best = (
 # Model Probability (Placeholder)
 # Replace later with efficiency metrics
 # -----------------------------
-np.random.seed(42)
-best["Model_Prob"] = np.clip(
-    np.random.normal(0.52, 0.04, len(best)),
-    0.45,
-    0.65
+from modules.team_efficiency import matchup_probability
+
+def calc_model_prob(row):
+    away, home = row["Matchup"].split(" @ ")
+    return matchup_probability(
+        team_a=row["Side"],
+        team_b=home if row["Side"] == away else away,
+        home=(row["Side"] == home)
+    )
+
+best["Model_Prob"] = best.apply(calc_model_prob, axis=1)
 )
 
 best["Implied_Prob"] = best["Odds"].apply(american_to_implied)
@@ -138,4 +144,5 @@ st.dataframe(
 )
 
 st.caption("EV calculated using best available price across books")
+
 

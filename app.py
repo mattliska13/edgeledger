@@ -1,13 +1,15 @@
-# NOTE: This is a full working dashboard with all requested features
-# (trimmed comments for readability)
+# EdgeLedger — Advanced Player Props Engine
+# Clean, stable version with Best Price per Player/Line
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import matplotlib.pyplot as plt
 from datetime import datetime
 
+# ======================
+# CONFIG
+# ======================
 API_KEY = "6a5d08e7c2407da6fb95b86ad9619bf0"
 
 st.set_page_config(layout="wide")
@@ -27,58 +29,97 @@ MARKET_MAP = {
 }
 
 BOOK_WEIGHTS = {
-    "pinnacle": 1.25,
-    "circa": 1.2,
-    "draftkings": 1.0,
-    "fanduel": 1.0
+    "Pinnacle": 1.25,
+    "Circa Sports": 1.2,
+    "DraftKings": 1.0,
+    "FanDuel": 1.0
 }
 
-def american_to_prob(o):
-    return 100 / (o + 100) if o > 0 else -o / (-o + 100)
+# ======================
+# HELPERS
+# ======================
+def american_to_prob(odds):
+    if odds > 0:
+        return 100 / (odds + 100)
+    return -odds / (-odds + 100)
 
 def fetch_odds(sport, market):
     url = f"https://api.the-odds-api.com/v4/sports/{SPORT_MAP[sport]}/odds"
-    return requests.get(url, params={
-        "apiKey": API_KEY,
-        "regions": "us",
-        "markets": MARKET_MAP[market],
-        "oddsFormat": "american"
-    }).json()
+    r = requests.get(
+        url,
+        params={
+            "apiKey": API_KEY,
+            "regions": "us",
+            "markets": MARKET_MAP[market],
+            "oddsFormat": "american",
+        },
+        timeout=10
+    )
+
+    if r.status_code != 200:
+        return []
+
+    return r.json()
 
 def normalize(raw):
     rows = []
 
     if not isinstance(raw, list):
-        return rows
+        return pd.DataFrame()
 
     for g in raw:
-        if not isinstance(g, dict):
-            continue
+        matchup = f"{g.get('away_team')} @ {g.get('home_team')}"
 
         for b in g.get("bookmakers", []):
-            if not isinstance(b, dict):
-                continue
+            book = b.get("title")
 
             for m in b.get("markets", []):
                 for o in m.get("outcomes", []):
                     rows.append({
-                        "game": f"{g.get('away_team')} @ {g.get('home_team')}",
-                        "book": b.get("title"),
-                        "side": o.get("name"),
+                        "matchup": matchup,
+                        "book": book,
+                        "player": o.get("name"),
                         "line": o.get("point"),
                         "odds": o.get("price")
                     })
 
-    return rows
+    return pd.DataFrame(rows)
 
-def project_receiving(t): return t * 0.65 * 11
-def project_rushing(c): return c * 4.4
-def anytime_td_prob(t): return min(0.85, t / 20)
+def add_best_price(df):
+    """
+    Reduce to best odds per player + line
+    """
+    idx = df.groupby(["player", "line"])["odds"].idxmax()
+    best = df.loc[idx].copy()
 
-# UI
-sport = st.sidebar.selectbox("Sport", ["NFL", "CFB", "UFC"])
+    best = best.rename(columns={
+        "odds": "best_odds",
+        "book": "best_book"
+    })
+
+    return best.reset_index(drop=True)
+
+# ======================
+# SIMPLE MODELS (PLACEHOLDERS)
+# ======================
+def project_receiving(targets):
+    return targets * 0.65 * 11
+
+def project_rushing(carries):
+    return carries * 4.4
+
+def anytime_td_prob(targets):
+    return min(0.85, targets / 20)
+
+# ======================
+# UI CONTROLS
+# ======================
+sport = st.sidebar.selectbox("Sport", list(SPORT_MAP.keys()))
 market = st.sidebar.selectbox("Prop Type", list(MARKET_MAP.keys()))
 
+# ======================
+# PIPELINE
+# ======================
 raw = fetch_odds(sport, market)
 df = normalize(raw)
 
@@ -86,32 +127,72 @@ if df.empty:
     st.warning("No props available.")
     st.stop()
 
-# Volume assumptions
+df = add_best_price(df)
+
+# ======================
+# VOLUME ASSUMPTIONS (TEMP)
+# ======================
 df["targets"] = np.random.randint(4, 10, len(df))
 df["carries"] = np.random.randint(8, 20, len(df))
 
+# ======================
+# MODEL LOGIC
+# ======================
 if market == "Receiving Yards":
     df["projection"] = df["targets"].apply(project_receiving)
+    df["model_prob"] = 0.55
+
 elif market == "Rushing Yards":
     df["projection"] = df["carries"].apply(project_rushing)
+    df["model_prob"] = 0.54
+
 elif market == "Anytime TD":
+    df["projection"] = np.nan
     df["model_prob"] = df["targets"].apply(anytime_td_prob)
+
 else:
     df["projection"] = np.nan
+    df["model_prob"] = 0.52
 
-df["implied_prob"] = df["odds"].apply(american_to_prob)
-df["model_prob"] = df.get("model_prob", 0.55)
-df["ev"] = (df["model_prob"] - df["implied_prob"]) * df["odds"].abs()
+# ======================
+# PRICING + EV
+# ======================
+df["implied_prob"] = df["best_odds"].apply(american_to_prob)
 
-df["book_weight"] = df["book"].map(BOOK_WEIGHTS).fillna(1.0)
-df = df.sort_values("odds", ascending=False)
+df["book_weight"] = df["best_book"].map(BOOK_WEIGHTS).fillna(1.0)
+
+df["ev"] = (
+    (df["model_prob"] - df["implied_prob"])
+    * df["book_weight"]
+    * 100
+)
+
+# ======================
+# DISPLAY
+# ======================
+st.subheader("Top 25 Player Props (Best Price, Highest EV)")
 
 top_props = df.sort_values("ev", ascending=False).head(25)
 
-st.subheader("Top 25 Player Props")
-st.dataframe(top_props, use_container_width=True)
+st.dataframe(
+    top_props[
+        [
+            "matchup",
+            "player",
+            "line",
+            "best_odds",
+            "best_book",
+            "model_prob",
+            "implied_prob",
+            "ev"
+        ]
+    ],
+    use_container_width=True
+)
 
-# Bet tracker
+# ======================
+# BET TRACKER
+# ======================
 if "bets" not in st.session_state:
     st.session_state.bets = []
 
@@ -121,13 +202,19 @@ if st.button("Log Top Prop"):
         "date": datetime.now(),
         "player": r["player"],
         "market": market,
-        "open_odds": r["odds"]
+        "line": r["line"],
+        "odds": r["best_odds"],
+        "book": r["best_book"]
     })
 
 bets_df = pd.DataFrame(st.session_state.bets)
-st.subheader("Logged Props")
-st.dataframe(bets_df)
 
+st.subheader("Logged Props")
+st.dataframe(bets_df, use_container_width=True)
+
+# ======================
+# EXPORT
+# ======================
 if not bets_df.empty:
     fname = f"weekly_props_{datetime.now().date()}.csv"
     bets_df.to_csv(fname, index=False)

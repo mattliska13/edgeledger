@@ -8,7 +8,7 @@ from datetime import datetime
 # Config
 # -------------------------
 API_KEY = st.secrets["ODDS_API_KEY"]
-
+st.write("DEBUG: API_KEY loaded successfully")
 st.set_page_config(layout="wide")
 st.title("EdgeLedger — Game Lines + Player Props (Best Price + EV)")
 

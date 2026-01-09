@@ -2,180 +2,169 @@ import streamlit as st
 import requests
 import pandas as pd
 
-# --------------------------
-# Page Config & Theme
-# --------------------------
-st.set_page_config(
-    page_title="EdgeLedger Dashboard",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# -------------------------------
+# CONFIG
+# -------------------------------
+st.set_page_config(page_title="EdgeLedger Dashboard", layout="wide")
+st.title("🏈 EdgeLedger Dashboard")
 
-# Hide Streamlit's default menu, footer, and header
-hide_streamlit_style = """
-            <style>
-            #MainMenu {visibility: hidden;}
-            footer {visibility: hidden;}
-            header {visibility: hidden;}
-            .css-18e3th9 {padding-top: 1rem;}  /* Reduce top padding */
-            </style>
-            """
-st.markdown(hide_streamlit_style, unsafe_allow_html=True)
-
-# Custom CSS for fonts, colors, cards
-st.markdown("""
-    <style>
-    body {font-family: 'Source Sans Pro', sans-serif; color: #111;}
-    .stButton>button {background-color:#FF4B4B; color:white; border-radius:10px;}
-    .stDataFrame {border: 1px solid #ccc; border-radius: 10px;}
-    h1 {color:#FF4B4B; font-family: 'Source Sans Pro', sans-serif;}
-    h2 {color:#333333; font-family: 'Source Sans Pro', sans-serif;}
-    </style>
-""", unsafe_allow_html=True)
-
-st.title("🔥 EdgeLedger Dashboard")
-
-# --------------------------
-# API Key
-# --------------------------
+# -------------------------------
+# API KEY
+# -------------------------------
 API_KEY = st.secrets.get("ODDS_API_KEY", "")
 if not API_KEY:
-    st.error("API_KEY not found in secrets.toml")
-    st.stop()
-st.sidebar.success("DEBUG: API_KEY loaded successfully")
+    st.error("API_KEY not found. Please set ODDS_API_KEY in Streamlit secrets.")
+else:
+    st.success("API_KEY loaded successfully")
 
-# --------------------------
-# Helper Functions
-# --------------------------
+# -------------------------------
+# SIDEBAR - DASHBOARD
+# -------------------------------
+st.sidebar.header("Dashboard")
+
+sport_key = st.sidebar.selectbox("Select Sport", ["americanfootball_nfl", "americanfootball_ncaaf"])
+scope = st.sidebar.radio("Scope", ["Game Lines", "Player Props"])
+
+# Player prop type dropdown (only if Player Props selected)
+prop_key = None
+if scope == "Player Props":
+    prop_map = {
+        "Passing TDs": "player_pass_tds",
+        "Passing Yards": "player_pass_yds",
+        "Rushing Yards": "player_rush_yds",
+        "Receiving Yards": "player_rec_yds",
+        "Total TDs": "player_total_tds"
+    }
+    prop_selection = st.sidebar.selectbox("Player Prop Type", list(prop_map.keys()))
+    prop_key = prop_map[prop_selection]
+
+# -------------------------------
+# UTILITY FUNCTIONS
+# -------------------------------
 def american_to_implied(odds):
-    if odds > 0:
-        return 100 / (odds + 100)
-    else:
-        return -odds / (-odds + 100)
+    """Convert American odds to implied probability"""
+    try:
+        odds = float(odds)
+        if odds > 0:
+            return 100 / (odds + 100)
+        else:
+            return -odds / (-odds + 100)
+    except:
+        return None
 
-def compute_ev(df, true_prob=None):
-    if df.empty:
-        return df
+def compute_ev(df):
+    """Compute expected value"""
     df["Implied"] = df["Price"].apply(american_to_implied)
-    if true_prob is None:
-        df["EV"] = df["Implied"] - 0.5
-    else:
-        df["EV"] = df.apply(lambda row: row["Implied"] - true_prob.get(row["Outcome"], 0.5), axis=1)
+    df["EV"] = (df["Probability"] - df["Implied"]) * 100
     return df
 
-def highlight_best(val, df, column="Price"):
-    if df.empty or column not in df.columns:
-        return ""
-    max_price = df.groupby(["Event", "Outcome"])[column].transform("max")
-    return "background-color: yellow" if val == max_price else ""
+def highlight_best(price, df, row):
+    """Highlight the best bookmaker price"""
+    subset = df[(df["Event"] == row["Event"]) & (df["Outcome"] == row["Outcome"])]
+    if price == subset["Price"].max():
+        return "background-color: #b6fcd5; font-weight: bold;"
+    return ""
 
-def ev_gradient(val, min_ev, max_ev):
-    if pd.isna(val):
-        return ""
-    if val >= 0:
-        pct = (val / max_ev) * 100 if max_ev > 0 else 0
-        color = f"rgba(0, 200, 0, 0.6)"
-    else:
-        pct = (val / min_ev) * 100 if min_ev < 0 else 0
-        color = f"rgba(200, 0, 0, 0.6)"
-    return f"background: linear-gradient(to right, {color} {pct}%, transparent {pct}%);"
-
-# --------------------------
-# Fetch Game Lines
-# --------------------------
-def fetch_game_lines(sport_key):
-    markets = ["h2h", "spreads", "totals"]
+# -------------------------------
+# FETCH GAME LINES
+# -------------------------------
+def fetch_game_lines():
+    st.sidebar.info(f"DEBUG: Using sport_key={sport_key}, scope=Game Lines")
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = {"apiKey": API_KEY, "regions": "us", "markets": ",".join(markets), "oddsFormat": "american"}
-    st.sidebar.debug(f"DEBUG: Using sport_key={sport_key}, scope=Game Lines")
+    params = {
+        "apiKey": API_KEY,
+        "regions": "us",
+        "markets": "h2h,spreads,totals",
+        "oddsFormat": "american"
+    }
     r = requests.get(url, params=params)
     r.raise_for_status()
     events = r.json()
-    all_lines = []
+    rows = []
     for e in events:
-        event_name = e.get("home_team") + " vs " + e.get("away_team")
-        for b in e.get("bookmakers", []):
-            for m in b.get("markets", []):
-                for o in m.get("outcomes", []):
-                    all_lines.append({
-                        "Event": event_name,
-                        "Outcome": o.get("name"),
-                        "Bookmaker": b.get("title"),
-                        "Price": o.get("price"),
+        for m in e.get("bookmakers", []):
+            for market in m.get("markets", []):
+                for outcome in market.get("outcomes", []):
+                    rows.append({
+                        "Event": e["home_team"] + " vs " + e["away_team"],
+                        "Outcome": outcome["name"],
+                        "Price": outcome["price"],
+                        "Bookmaker": m["title"],
+                        "Market": market["key"],
+                        "Probability": outcome.get("probability", 0)
                     })
-    df = pd.DataFrame(all_lines)
-    return compute_ev(df)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = compute_ev(df)
+        df.sort_values("EV", ascending=False, inplace=True)
+    return df
 
-# --------------------------
-# Fetch Player Props
-# --------------------------
-PROP_TYPE_MAP = {
-    "Passing TDs": "player_pass_tds",
-    "Passing Yards": "player_pass_yards",
-    "Rushing Yards": "player_rush_yards",
-    "Receiving Yards": "player_rec_yards",
-    "Touchdowns": "player_tds",
-}
-
-def fetch_player_props(sport_key, player_prop_type):
-    st.sidebar.debug(f"DEBUG: Using sport_key={sport_key}, scope=Player Props, player_prop_type={player_prop_type}")
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = {"apiKey": API_KEY, "regions": "us", "markets": "player_props", "oddsFormat": "american"}
-    r = requests.get(url, params=params)
+# -------------------------------
+# FETCH PLAYER PROPS
+# -------------------------------
+def fetch_player_props():
+    st.sidebar.info(f"DEBUG: Using sport_key={sport_key}, scope=Player Props, player_prop_type={prop_key}")
+    
+    # Step 1: fetch events
+    url_events = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+    params_events = {
+        "apiKey": API_KEY,
+        "regions": "us",
+        "markets": "player_props",
+        "oddsFormat": "american"
+    }
+    r = requests.get(url_events, params=params_events)
     r.raise_for_status()
     events = r.json()
-    all_props = []
+
+    rows = []
+    # Step 2: filter props per selected prop_key
     for e in events:
-        event_name = e.get("home_team") + " vs " + e.get("away_team")
-        for b in e.get("bookmakers", []):
-            for m in b.get("markets", []):
-                if m.get("key") != player_prop_type:
+        for m in e.get("bookmakers", []):
+            for market in m.get("markets", []):
+                if market.get("key") != "player_props":
                     continue
-                for o in m.get("outcomes", []):
-                    all_props.append({
-                        "Event": event_name,
-                        "Outcome": o.get("name"),
-                        "Bookmaker": b.get("title"),
-                        "Price": o.get("price"),
+                for outcome in market.get("outcomes", []):
+                    # only include selected prop type
+                    if outcome.get("name_key") != prop_key:
+                        continue
+                    rows.append({
+                        "Event": e["home_team"] + " vs " + e["away_team"],
+                        "Player": outcome.get("name", ""),
+                        "Outcome": outcome.get("label", ""),
+                        "Price": outcome.get("price", 0),
+                        "Bookmaker": m["title"],
+                        "Probability": outcome.get("probability", 0)
                     })
-    df = pd.DataFrame(all_props, columns=["Event", "Outcome", "Bookmaker", "Price"])
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = compute_ev(df)
+        df.sort_values("EV", ascending=False, inplace=True)
+    return df
+
+# -------------------------------
+# MAIN DISPLAY
+# -------------------------------
+if scope == "Game Lines":
+    df = fetch_game_lines()
     if df.empty:
-        st.warning("No player props returned for selected prop type.")
-        return df
-    return compute_ev(df)
+        st.warning("No Game Lines available.")
+    else:
+        st.subheader(f"Game Lines — {sport_key.upper()}")
+        st.dataframe(df.style.apply(lambda x: [highlight_best(p, df, x) for p in x["Price"]], axis=1))
+        st.info("Top 2–5 bets are ranked by EV.")
 
-# --------------------------
-# Dashboard Sidebar
-# --------------------------
-st.sidebar.header("📊 Dashboard")
-sport_options = {"NFL": "americanfootball_nfl", "CFB": "americanfootball_ncaaf"}
-sport_choice = st.sidebar.selectbox("Select Sport", options=list(sport_options.keys()))
-sport_key = sport_options[sport_choice]
+elif scope == "Player Props":
+    df = fetch_player_props()
+    if df.empty:
+        st.warning("No Player Props available for this type.")
+    else:
+        st.subheader(f"Player Props — {prop_selection} ({sport_key.upper()})")
+        st.dataframe(df.style.apply(lambda x: [highlight_best(p, df, x) for p in x["Price"]], axis=1))
+        st.info("Top 2–5 props ranked by EV.")
 
-scope_options = ["Game Lines", "Player Props"]
-scope_choice = st.sidebar.radio("Scope", options=scope_options)
-
-# Player Prop dropdown (only if Player Props selected)
-if scope_choice == "Player Props":
-    player_prop_dropdown = st.sidebar.selectbox("Player Prop Type", list(PROP_TYPE_MAP.keys()))
-    prop_key = PROP_TYPE_MAP[player_prop_dropdown]
-
-# --------------------------
-# Fetch & Display Data
-# --------------------------
-if scope_choice == "Game Lines":
-    df = fetch_game_lines(sport_key)
-    st.subheader(f"🔥 Game Lines ({sport_choice})")
-elif scope_choice == "Player Props":
-    df = fetch_player_props(sport_key, prop_key)
-    st.subheader(f"🔥 Player Props ({sport_choice} — {player_prop_dropdown})")
-
-if not df.empty:
-    top_bets = df.sort_values("EV", ascending=False).head(5)
-    min_ev, max_ev = df["EV"].min(), df["EV"].max()
-    st.subheader("Top Bets Ranked by EV")
-    st.dataframe(top_bets.style
-                 .applymap(lambda x: highlight_best(x, df), subset=["Price"])
-                 .applymap(lambda x: ev_gradient(x, min_ev, max_ev), subset=["EV"]))
-else:
-    st.info("No data available for the selected sport/scope/prop type.")
+# -------------------------------
+# FOOTER / DEBUG
+# -------------------------------
+st.sidebar.markdown("---")
+st.sidebar.text("EdgeLedger Dashboard v1.0")

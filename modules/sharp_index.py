@@ -1,6 +1,12 @@
-def sharp_index(line_open, line_current, handle_pct):
+def sharp_indicator(open_line, current_line, public_pct):
     """
-    Simple market-maker detection proxy
+    Sharp signal increases when:
+    - Line moves against public
+    - Public > 60% but line doesn't follow
     """
-    move = abs(line_current - line_open)
-    return round(move * (1 - handle_pct), 3)
+    move = current_line - open_line
+    if public_pct > 0.6 and move <= 0:
+        return "SHARP"
+    if public_pct < 0.4 and move >= 0:
+        return "SHARP"
+    return "PUBLIC"

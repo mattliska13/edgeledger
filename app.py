@@ -1,23 +1,13 @@
-# EdgeLedger — Advanced Betting Engine
-# Supports Game Lines + Player Props with Independent Dropdowns
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime
 
-# ======================
-# CONFIG
-# ======================
-API_KEY = "6a5d08e7c2407da6fb95b86ad9619bf0"
+API_KEY = st.secrets["ODDS_API_KEY"]
 
 st.set_page_config(layout="wide")
-st.title("EdgeLedger — Advanced Betting Engine")
+st.title("EdgeLedger — Game Lines + Player Props")
 
-# ======================
-# SPORT + MARKET MAPS
-# ======================
 SPORT_MAP = {
     "NFL": "americanfootball_nfl",
     "CFB": "americanfootball_ncaaf",
@@ -30,189 +20,152 @@ GAME_MARKETS = {
     "Moneyline": "h2h"
 }
 
-PLAYER_PROP_MARKETS = {
-    "Anytime TD": "player_anytime_td",
-    "Receiving Yards": "player_receptions_yards",
-    "Rushing Yards": "player_rushing_yards",
-    "Passing Yards": "player_passing_yards"
-}
+PLAYER_PROP_MARKETS = [
+    "player_pass_tds",
+    "player_rush_yds",
+    "player_pass_rush_reception_tds",
+    "player_pass_yds"
+]
 
 BOOK_WEIGHTS = {
-    "Pinnacle": 1.25,
-    "Circa Sports": 1.2,
     "DraftKings": 1.0,
-    "FanDuel": 1.0
+    "FanDuel": 1.0,
+    "Pinnacle": 1.2,
+    "Circa Sports": 1.15
 }
 
-# ======================
-# HELPERS
-# ======================
-def american_to_prob(odds):
-    if odds > 0:
-        return 100 / (odds + 100)
-    return -odds / (-odds + 100)
 
-def fetch_odds(sport, market_key):
+def fetch_game_odds(sport, market):
     url = f"https://api.the-odds-api.com/v4/sports/{SPORT_MAP[sport]}/odds"
-    r = requests.get(
+    resp = requests.get(
         url,
         params={
             "apiKey": API_KEY,
             "regions": "us",
-            "markets": market_key,
+            "markets": market,
             "oddsFormat": "american"
         },
         timeout=10
     )
-    return r.json() if r.status_code == 200 else []
+    return resp.json() if resp.status_code == 200 else []
 
-def normalize(raw, is_player_prop=False):
+
+def normalize_game(raw):
     rows = []
-
-    if not isinstance(raw, list):
-        return pd.DataFrame()
-
     for g in raw:
-        matchup = f"{g.get('away_team')} @ {g.get('home_team')}"
-
+        matchup = f\"{g.get("away_team")} @ {g.get("home_team")}\"
         for b in g.get("bookmakers", []):
             book = b.get("title")
-
             for m in b.get("markets", []):
                 for o in m.get("outcomes", []):
                     rows.append({
                         "matchup": matchup,
-                        "book": book,
-                        "entity": o.get("name") if is_player_prop else matchup,
+                        "market": m.get("key"),
                         "side": o.get("name"),
                         "line": o.get("point"),
-                        "odds": o.get("price")
+                        "odds": o.get("price"),
+                        "book": book
                     })
-
     return pd.DataFrame(rows)
 
-def add_best_price(df):
-    idx = df.groupby(["entity", "line", "side"])["odds"].idxmax()
-    best = df.loc[idx].copy()
 
-    best = best.rename(columns={
-        "odds": "best_odds",
-        "book": "best_book"
-    })
+def fetch_events(sport):
+    url = f"https://api.the-odds-api.com/v4/sports/{SPORT_MAP[sport]}/events"
+    resp = requests.get(url, params={"apiKey": API_KEY, "regions": "us"}, timeout=10)
+    return resp.json() if resp.status_code == 200 else []
 
-    return best.reset_index(drop=True)
 
-# ======================
-# SIMPLE MODELS (PLACEHOLDERS)
-# ======================
-def game_model_prob():
-    return 0.525  # replace later with efficiency-based model
+def fetch_event_odds(sport, event_id, markets):
+    url = f"https://api.the-odds-api.com/v4/sports/{SPORT_MAP[sport]}/events/{event_id}/odds"
+    resp = requests.get(
+        url,
+        params={
+            "apiKey": API_KEY,
+            "regions": "us",
+            "markets": ",".join(markets),
+            "oddsFormat": "american"
+        },
+        timeout=10
+    )
+    return resp.json() if resp.status_code == 200 else []
 
-def player_model_prob():
-    return 0.55
 
-# ======================
-# SIDEBAR CONTROLS
-# ======================
+def normalize_props(raw, event_id):
+    rows = []
+    if not raw:
+        return pd.DataFrame()
+
+    # raw should be a list with 1 event
+    ev = raw[0]
+    matchup = f\"{ev.get('away_team')} @ {ev.get('home_team')}\"
+
+    for b in ev.get("bookmakers", []):
+        book = b.get("title")
+        for m in b.get("markets", []):
+            for o in m.get("outcomes", []):
+                rows.append({
+                    "event_id": event_id,
+                    "matchup": matchup,
+                    "market": m.get("key"),
+                    "player": o.get("description", o.get("name")),
+                    "prop_side": o.get("name"),
+                    "line": o.get("point"),
+                    "odds": o.get("price"),
+                    "book": book
+                })
+    return pd.DataFrame(rows)
+
+
+# ==============================
+# SIDEBAR
+# ==============================
+
 sport = st.sidebar.selectbox("Sport", list(SPORT_MAP.keys()))
 
-bet_type = st.sidebar.radio(
-    "Bet Type",
-    ["Game Lines", "Player Props"]
-)
+bet_scope = st.sidebar.radio("Select Scope", ["Game Lines", "Player Props"])
 
-if bet_type == "Game Lines":
-    market_label = st.sidebar.selectbox("Game Market", list(GAME_MARKETS.keys()))
-    market_key = GAME_MARKETS[market_label]
-    is_player_prop = False
+# =========== Game Lines ===========
+if bet_scope == "Game Lines":
+    game_market = st.sidebar.selectbox("Market", list(GAME_MARKETS.keys()))
 
+    raw_odds = fetch_game_odds(sport, GAME_MARKETS[game_market])
+    df_games = normalize_game(raw_odds)
+
+    if df_games.empty:
+        st.warning("No game lines available.")
+    else:
+        df_games["implied_prob"] = df_games["odds"].apply(lambda o: 100 / (o + 100) if o > 0 else -o / (-o + 100))
+        df_games["model_prob"] = 0.52
+        df_games["ev"] = (df_games["model_prob"] - df_games["implied_prob"]) * df_games["odds"].abs()
+
+        st.subheader(f"{sport} — {game_market}")
+        st.dataframe(df_games, use_container_width=True)
+
+# ========== Player Props ===========
 else:
-    market_label = st.sidebar.selectbox("Player Prop", list(PLAYER_PROP_MARKETS.keys()))
-    market_key = PLAYER_PROP_MARKETS[market_label]
-    is_player_prop = True
+    st.sidebar.write("Select Event")
 
-# ======================
-# DATA PIPELINE
-# ======================
-raw = fetch_odds(sport, market_key)
-df = normalize(raw, is_player_prop=is_player_prop)
+    events = fetch_events(sport)
 
-if df.empty:
-    st.warning("No markets available.")
-    st.stop()
+    if not events:
+        st.warning("No upcoming events found.")
+        st.stop()
 
-df = add_best_price(df)
+    event_options = {f\"{e['away_team']} @ {e['home_team']}\": e["id"] for e in events}
+    selected_event = st.sidebar.selectbox("Event", list(event_options.keys()))
 
-# ======================
-# MODEL + EV
-# ======================
-if bet_type == "Game Lines":
-    df["model_prob"] = game_model_prob()
-else:
-    df["model_prob"] = player_model_prob()
+    event_id = event_options[selected_event]
 
-df["implied_prob"] = df["best_odds"].apply(american_to_prob)
-df["book_weight"] = df["best_book"].map(BOOK_WEIGHTS).fillna(1.0)
+    props_data = fetch_event_odds(sport, event_id, PLAYER_PROP_MARKETS)
+    df_props = normalize_props(props_data, event_id)
 
-df["ev"] = (
-    (df["model_prob"] - df["implied_prob"])
-    * df["book_weight"]
-    * 100
-)
+    if df_props.empty:
+        st.warning("No player props found for this event.")
+    else:
+        df_props["implied_prob"] = df_props["odds"].apply(lambda o: 100 / (o + 100) if o > 0 else -o / (-o + 100))
+        df_props["model_prob"] = 0.55
+        df_props["ev"] = (df_props["model_prob"] - df_props["implied_prob"]) * df_props["odds"].abs()
 
-# ======================
-# DISPLAY
-# ======================
-st.subheader(f"Top 25 {bet_type} — {market_label}")
+        st.subheader(f"{sport} — Props — {selected_event}")
+        st.dataframe(df_props, use_container_width=True)
 
-top = df.sort_values("ev", ascending=False).head(25)
-
-st.dataframe(
-    top[
-        [
-            "matchup",
-            "entity",
-            "side",
-            "line",
-            "best_odds",
-            "best_book",
-            "model_prob",
-            "implied_prob",
-            "ev"
-        ]
-    ],
-    use_container_width=True
-)
-
-# ======================
-# BET TRACKER
-# ======================
-if "bets" not in st.session_state:
-    st.session_state.bets = []
-
-if st.button("Log Top Bet"):
-    r = top.iloc[0]
-    st.session_state.bets.append({
-        "date": datetime.now(),
-        "sport": sport,
-        "bet_type": bet_type,
-        "market": market_label,
-        "entity": r["entity"],
-        "side": r["side"],
-        "line": r["line"],
-        "odds": r["best_odds"],
-        "book": r["best_book"]
-    })
-
-bets_df = pd.DataFrame(st.session_state.bets)
-
-st.subheader("Logged Bets")
-st.dataframe(bets_df, use_container_width=True)
-
-# ======================
-# EXPORT
-# ======================
-if not bets_df.empty:
-    fname = f"bets_{datetime.now().date()}.csv"
-    bets_df.to_csv(fname, index=False)
-    st.success(f"Exported: {fname}")

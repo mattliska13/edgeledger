@@ -33,6 +33,7 @@ def fetch_odds(sport_key, markets):
     return r.json()
 
 def american_to_decimal(odds):
+    """Convert American odds to decimal for EV calculation."""
     if odds > 0:
         return (odds / 100) + 1
     else:
@@ -48,7 +49,7 @@ def highlight_best(cell, line, df):
     """Highlight best bookmaker per line/outcome."""
     subset = df[df["Line"] == line]
     if not subset.empty:
-        if cell == subset["DecimalOdds"].max():
+        if cell == subset["AmericanOdds"].max():
             return "background-color: #b3ffb3"  # light green
     return ""
 
@@ -63,7 +64,7 @@ player_prop_type = None
 if scope == "Player Props" and sport_name in ["NFL", "CFB"]:
     player_prop_type = st.sidebar.selectbox(
         "Player Prop Type",
-        ["passing", "rushing", "receiving", "touchdowns"]
+        ["Touchdowns", "Passing Yards", "Rushing Yards", "Receiving Yards"]
     )
 
 # -----------------------
@@ -83,7 +84,7 @@ markets = []
 if scope == "Game Lines":
     markets = ["h2h", "spreads", "totals"]
 elif scope == "Player Props":
-    markets = ["player_props"]  # FIX: Always fetch player_props as market
+    markets = ["player_props"]  # always fetch player_props
 
 # -----------------------
 # FETCH DATA
@@ -98,6 +99,13 @@ except requests.HTTPError as e:
 # -----------------------
 # NORMALIZE DATA
 # -----------------------
+prop_filter_map = {
+    "Touchdowns": "touchdown",
+    "Passing Yards": "passing yards",
+    "Rushing Yards": "rushing yards",
+    "Receiving Yards": "receiving yards"
+}
+
 rows = []
 for event in events:
     event_name = (
@@ -106,17 +114,17 @@ for event in events:
     )
     for bookmaker in event.get("bookmakers", []):
         for market in bookmaker.get("markets", []):
-            # FILTER player props outcomes if applicable
             for outcome in market.get("outcomes", []):
                 if scope == "Player Props" and player_prop_type:
-                    # Only include the selected prop type
-                    if player_prop_type not in outcome["name"].lower():
+                    filter_keyword = prop_filter_map[player_prop_type].lower()
+                    if filter_keyword not in outcome["name"].lower():
                         continue
                 decimal_odds = american_to_decimal(outcome["price"])
                 rows.append({
                     "Event": event_name,
                     "Bookmaker": bookmaker["title"],
                     "Line": outcome.get("name", outcome.get("label", "")),
+                    "AmericanOdds": outcome["price"],  # Keep original American odds
                     "DecimalOdds": decimal_odds,
                     "ImpliedProb": implied_probability(outcome["price"]),
                     "EV": calc_ev(decimal_odds, implied_probability(outcome["price"])),
@@ -141,7 +149,7 @@ st.title(f"EdgeLedger — {scope} ({sport_name})")
 st.subheader("Top Bets Ranked by EV")
 
 # Highlight best bookmaker
-styled = top_bets.style.applymap(lambda x: highlight_best(x, top_bets["Line"], top_bets), subset=["DecimalOdds"])
+styled = top_bets.style.applymap(lambda x: highlight_best(x, top_bets["Line"], top_bets), subset=["AmericanOdds"])
 st.dataframe(styled, use_container_width=True)
 
 # Show all available lines for transparency

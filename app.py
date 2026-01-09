@@ -1,15 +1,13 @@
-# app.py — EdgeLedger Dashboard (NFL/CFB)
-# ✅ Separate API calls: Game Lines vs Player Props (event-by-event, 1 market per request)
-# ✅ Auto-discover markets per sport and populate dropdown dynamically
-# ✅ No dependency on uploads (no CSV required)
-# ✅ Prop-specific modeling buckets (QB vs RB vs WR/TE) with reasonable defaults
-# ✅ Uses market-implied consensus as baseline "true prob" + small model adjustments
-# ✅ Best price + EV + Top 2–5 auto-ranked bets
-# ✅ Kelly bankroll sizing
-# ✅ Debug logging (safe, no sidebar.debug)
+# app.py — EdgeLedger Dashboard (NFL / CFB)
+# ✅ Game Lines + Player Props with completely separate API paths (prevents 422)
+# ✅ Auto-discover prop markets per sport (dynamic dropdown)
+# ✅ NO Kelly / bankroll sizing anywhere
+# ✅ Best price across books + EV (using consensus implied baseline)
+# ✅ Auto-ranked Top 2–5 bets
+# ✅ Robust empty checks + debug logging
+# ✅ No upload dependencies
 
 import os
-import math
 from datetime import datetime, timezone
 
 import numpy as np
@@ -38,6 +36,11 @@ div[data-testid="stMetric"]{
   padding: 10px 12px; border-radius: 14px;
 }
 .small-note {opacity:.85; font-size: 0.92rem;}
+.badge {
+  display:inline-block; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.05);
+  font-size: 0.85rem; margin-left: 6px;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -59,9 +62,7 @@ ODDS_FORMAT = "american"
 HEADERS = {"User-Agent": "EdgeLedgerDashboard/1.0"}
 
 SPORTS = {"NFL": "americanfootball_nfl", "CFB": "americanfootball_ncaaf"}
-
 GAME_MARKETS = {"Moneyline (H2H)": "h2h", "Spreads": "spreads", "Totals": "totals"}
-
 
 # -----------------------------
 # HELPERS
@@ -96,35 +97,6 @@ def american_to_implied(odds):
     return (-o) / ((-o) + 100.0)
 
 
-def american_to_decimal(odds):
-    o = float(odds)
-    if o > 0:
-        return 1.0 + (o / 100.0)
-    return 1.0 + (100.0 / abs(o))
-
-
-def kelly_fraction(p, odds_american, kelly_cap=0.10, kelly_multiplier=0.50):
-    """
-    Kelly sizing for a single bet.
-    - kelly_multiplier: 0.5 => half Kelly
-    - kelly_cap: max fraction of bankroll
-    """
-    try:
-        p = float(p)
-        if not (0 < p < 1):
-            return 0.0
-        dec = american_to_decimal(odds_american)
-        b = dec - 1.0
-        q = 1.0 - p
-        if b <= 0:
-            return 0.0
-        f = (b * p - q) / b
-        f = max(0.0, f) * kelly_multiplier
-        return float(min(f, kelly_cap))
-    except Exception:
-        return 0.0
-
-
 def pretty_market_name(mkey: str) -> str:
     return (mkey or "").replace("_", " ").title()
 
@@ -144,8 +116,8 @@ def infer_position_bucket(market_key: str) -> str:
 
 def consensus_true_prob(df_group: pd.DataFrame) -> float:
     """
-    Baseline “real” probability without external projections:
-    Use average implied probability across books for the exact selection (vig not removed perfectly, but stable).
+    Baseline “real” probability without projections:
+    average implied probability across books for the exact selection.
     """
     vals = df_group["Implied"].dropna().values
     if len(vals) == 0:
@@ -155,16 +127,15 @@ def consensus_true_prob(df_group: pd.DataFrame) -> float:
 
 def apply_bucket_adjustment(p_base: float, bucket: str, market_key: str) -> float:
     """
-    Tiny model adjustment on top of consensus implied to simulate QB/RB/WR differences
-    WITHOUT any uploads. Keeps EV conservative.
+    Small conservative adjustment to break ties (QB vs RB vs WR/TE) without external data.
     """
     if np.isnan(p_base):
         return np.nan
     mk = (market_key or "").lower()
     b = (bucket or "").upper()
-
     adj = 0.0
-    # TD props: slightly favor RB/WR types vs QB
+
+    # TD props: slightly favor RB / WR/TE, slightly fade QB (conservative)
     if "anytime" in mk or "td" in mk:
         if b == "RB":
             adj += 0.010
@@ -173,11 +144,10 @@ def apply_bucket_adjustment(p_base: float, bucket: str, market_key: str) -> floa
         elif b == "QB":
             adj -= 0.005
 
-    # Passing yard overs slightly regressed (market tends to be sharper)
-    if "pass_yd" in mk or "pass" in mk and "yd" in mk:
+    # Passing yard overs tend to be sharper; tiny regression
+    if ("pass" in mk) and ("yd" in mk):
         adj -= 0.004
 
-    # Clamp
     return float(np.clip(p_base + adj, 0.02, 0.98))
 
 
@@ -217,6 +187,7 @@ def normalize_game_lines(raw: list) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return df
+
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
     df["Line"] = pd.to_numeric(df["Line"], errors="coerce")
     df["Implied"] = df["Price"].apply(american_to_implied)
@@ -226,11 +197,6 @@ def normalize_game_lines(raw: list) -> pd.DataFrame:
 def normalize_event_props(event_odds_json: dict, market_key: str) -> pd.DataFrame:
     """
     Normalizes /events/{event_id}/odds response for ONE prop market into player-based rows.
-    Outcomes typically include:
-      - outcome.description: player name
-      - outcome.name: Over/Under or Yes/No (sometimes player)
-      - outcome.point: line (yards), may be null for TD
-      - outcome.price: odds (american)
     """
     if not isinstance(event_odds_json, dict):
         return pd.DataFrame()
@@ -255,11 +221,6 @@ def normalize_event_props(event_odds_json: dict, market_key: str) -> pd.DataFram
                     or ""
                 )
                 player = (player or "").strip()
-
-                line = out.get("point")
-                price = out.get("price")
-
-                # If player missing, skip; we want truly player-based
                 if not player:
                     continue
 
@@ -270,8 +231,8 @@ def normalize_event_props(event_odds_json: dict, market_key: str) -> pd.DataFram
                         Market=market_key,
                         Player=player,
                         Side=side,
-                        Line=line,
-                        Price=price,
+                        Line=out.get("point"),
+                        Price=out.get("price"),
                         Book=book,
                     )
                 )
@@ -284,11 +245,15 @@ def normalize_event_props(event_odds_json: dict, market_key: str) -> pd.DataFram
     df["Line"] = pd.to_numeric(df["Line"], errors="coerce")
     df["Implied"] = df["Price"].apply(american_to_implied)
     df["Side"] = df["Side"].fillna("").astype(str)
+    df["Player"] = df["Player"].fillna("").astype(str).str.strip()
     return df
 
 
 def best_price_table(df: pd.DataFrame, group_cols: list[str], price_col: str = "Price") -> pd.DataFrame:
-    """Best price across books: max numeric works for + and - American odds."""
+    """
+    Best price across books for American odds = numeric max
+    (+200 > +180, -105 > -115).
+    """
     if df.empty:
         return df
     idx = df.groupby(group_cols)[price_col].idxmax()
@@ -322,7 +287,7 @@ def api_fetch_game_lines(sport_key: str, markets: list[str]):
         "oddsFormat": ODDS_FORMAT,
     }
     ok, payload, status = safe_get(url, params=params)
-    debug = {"url": url, "status": status, "ok": ok, "error": None, "sample": None}
+    debug = {"url": url, "status": status, "ok": ok, "error": None, "markets": markets, "sample": None}
     if ok and isinstance(payload, list):
         debug["sample"] = payload[0] if payload else None
         return normalize_game_lines(payload), debug
@@ -354,7 +319,7 @@ def api_fetch_event_props(sport_key: str, event_id: str, market_key: str):
         "oddsFormat": ODDS_FORMAT,
     }
     ok, payload, status = safe_get(url, params=params)
-    debug = {"url": url, "status": status, "ok": ok, "error": None}
+    debug = {"url": url, "status": status, "ok": ok, "error": None, "market": market_key}
     if ok and isinstance(payload, dict):
         return normalize_event_props(payload, market_key), debug
     debug["error"] = payload
@@ -372,10 +337,7 @@ view = st.sidebar.radio("View", ["Game Lines", "Player Props"], index=0)
 debug_mode = st.sidebar.toggle("Show Debug", value=False)
 
 st.sidebar.markdown("---")
-bankroll = st.sidebar.number_input("Bankroll ($)", min_value=0.0, value=1000.0, step=50.0)
-kelly_mult = st.sidebar.slider("Kelly Multiplier", 0.10, 1.00, 0.50, 0.05)
-kelly_cap = st.sidebar.slider("Kelly Cap (max % bankroll)", 0.01, 0.25, 0.10, 0.01)
-top_n = st.sidebar.slider("Auto-rank Top Bets", 2, 5, 3, 1)
+top_n = st.sidebar.slider("Auto-rank Top Bets (by EV)", 2, 5, 3, 1)
 
 # -----------------------------
 # HEADER METRICS
@@ -388,7 +350,7 @@ c3.metric("Mode", view)
 tabs = st.tabs(["Dashboard", "All Books (Raw)", "Setup Help"])
 
 # -----------------------------
-# GAME LINES (SEPARATE PATH)
+# GAME LINES
 # -----------------------------
 if view == "Game Lines":
     chosen_human = st.sidebar.multiselect(
@@ -396,7 +358,12 @@ if view == "Game Lines":
         list(GAME_MARKETS.keys()),
         default=["Spreads", "Totals", "Moneyline (H2H)"],
     )
-    chosen = [GAME_MARKETS[x] for x in chosen_human] or ["spreads"]
+
+    # ✅ Bulletproof default if user unselects everything (fixes "No game line data..." due to empty markets)
+    if not chosen_human:
+        chosen = ["h2h", "spreads", "totals"]
+    else:
+        chosen = [GAME_MARKETS[x] for x in chosen_human]
 
     df_lines, dbg_lines = api_fetch_game_lines(sport_key, chosen)
 
@@ -405,7 +372,9 @@ if view == "Game Lines":
         st.sidebar.write(dbg_lines)
 
     if df_lines.empty:
-        st.warning("No game line data available for these settings.")
+        st.warning("No game line data available right now for these settings (or no upcoming games returned).")
+        if debug_mode:
+            st.info("Turn on Debug and check status/error payload in the sidebar.")
     else:
         raw = df_lines.copy()
 
@@ -413,7 +382,7 @@ if view == "Game Lines":
         best = best_price_table(raw, ["Event", "Market", "Outcome", "Line"], "Price")
         best["Best Implied"] = best["Best Price"].apply(american_to_implied)
 
-        # Consensus "true prob" per selection across books
+        # Consensus baseline p_true per selection across books
         cons = (
             raw.groupby(["Event", "Market", "Outcome", "Line"])
             .apply(consensus_true_prob)
@@ -422,22 +391,18 @@ if view == "Game Lines":
         )
         best = best.merge(cons, on=["Event", "Market", "Outcome", "Line"], how="left")
 
-        # EV + Kelly
+        # EV
         best["EV"] = (best["P_true"] - best["Best Implied"]) * 100.0
-        best["Kelly %"] = best.apply(
-            lambda r: kelly_fraction(r["P_true"], r["Best Price"], kelly_cap=kelly_cap, kelly_multiplier=kelly_mult),
-            axis=1,
-        )
-        best["Stake $"] = (best["Kelly %"] * bankroll).round(2)
 
         best = best.sort_values("EV", ascending=False)
         top = best.head(top_n).copy()
 
         with tabs[0]:
-            st.subheader("🔥 Auto-Ranked Top Bets (Game Lines)")
+            st.subheader("🔥 Auto-Ranked Top Bets (Game Lines)  ")
+            st.caption("Best price highlights the single best bookmaker per line. EV uses consensus implied baseline (no external model).")
             st.dataframe(
                 top[
-                    ["Event", "Market", "Outcome", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV", "Kelly %", "Stake $"]
+                    ["Event", "Market", "Outcome", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]
                 ],
                 use_container_width=True,
             )
@@ -445,7 +410,7 @@ if view == "Game Lines":
             st.subheader("Best Price Board (Game Lines)")
             st.dataframe(
                 best[
-                    ["Event", "Market", "Outcome", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV", "Kelly %", "Stake $"]
+                    ["Event", "Market", "Outcome", "Line", "Best Price", "Best Book", "P_true", "Best Implied", "EV"]
                 ],
                 use_container_width=True,
             )
@@ -458,15 +423,16 @@ if view == "Game Lines":
             )
 
 # -----------------------------
-# PLAYER PROPS (SEPARATE PATH + AUTO-DISCOVERY)
+# PLAYER PROPS
 # -----------------------------
 else:
     markets_list, dbg_mk = api_discover_markets(sport_key)
+
     if debug_mode:
         st.sidebar.markdown("**DEBUG (Market Discovery)**")
         st.sidebar.write(dbg_mk)
 
-    # Build a map of market_key -> market_name
+    # Build key -> name mapping
     discovered = {}
     for m in markets_list:
         if isinstance(m, dict):
@@ -475,7 +441,7 @@ else:
             if k:
                 discovered[k] = n
 
-    # Filter likely player props (keys often start with "player_")
+    # Filter likely player props
     player_markets = sorted([k for k in discovered.keys() if k.startswith("player_") and k != "player_props"])
     if not player_markets:
         st.warning("No player prop markets discovered for this sport on your plan/books right now.")
@@ -490,6 +456,7 @@ else:
 
     # Fetch events (separate endpoint)
     events, dbg_ev = api_fetch_events(sport_key)
+
     if debug_mode:
         st.sidebar.markdown("**DEBUG (Events)**")
         st.sidebar.write(dbg_ev)
@@ -536,10 +503,9 @@ else:
         st.warning("Props returned, but player fields were empty/unusable.")
         st.stop()
 
-    # Buckets: QB/RB/WR-TE
     raw_props["PosBucket"] = raw_props["Market"].apply(infer_position_bucket)
 
-    # Consensus baseline p_true per player/side/line selection (across books)
+    # Baseline p_base per player/side/line selection (across books)
     group_cols = ["Event", "Market", "Player", "Side", "Line"]
     cons = raw_props.groupby(group_cols).apply(consensus_true_prob).rename("P_base").reset_index()
 
@@ -547,29 +513,23 @@ else:
     best = best_price_table(raw_props, group_cols, "Price")
     best["Best Implied"] = best["Best Price"].apply(american_to_implied)
 
-    # Merge base prob
+    # Merge base prob, apply bucket adjustment
     best = best.merge(cons, on=group_cols, how="left")
-
-    # Apply prop-specific bucket adjustments (QB/RB/WR-TE logic)
     best["PosBucket"] = best["Market"].apply(infer_position_bucket)
     best["P_used"] = best.apply(lambda r: apply_bucket_adjustment(r["P_base"], r["PosBucket"], r["Market"]), axis=1)
 
-    # EV + Kelly
+    # EV
     best["EV"] = (best["P_used"] - best["Best Implied"]) * 100.0
-    best["Kelly %"] = best.apply(
-        lambda r: kelly_fraction(r["P_used"], r["Best Price"], kelly_cap=kelly_cap, kelly_multiplier=kelly_mult),
-        axis=1,
-    )
-    best["Stake $"] = (best["Kelly %"] * bankroll).round(2)
 
     best = best.sort_values("EV", ascending=False)
     top = best.head(top_n).copy()
 
     with tabs[0]:
         st.subheader(f"🔥 Auto-Ranked Top Bets (Player Props) — {discovered.get(prop_market_key, pretty_market_name(prop_market_key))}")
+        st.caption("Best price highlights the single best bookmaker per prop. EV uses consensus implied baseline + small position-bucket adjustment.")
         st.dataframe(
             top[
-                ["Event", "Player", "Side", "Line", "Best Price", "Best Book", "PosBucket", "P_used", "Best Implied", "EV", "Kelly %", "Stake $"]
+                ["Event", "Player", "Side", "Line", "Best Price", "Best Book", "PosBucket", "P_used", "Best Implied", "EV"]
             ],
             use_container_width=True,
         )
@@ -577,7 +537,7 @@ else:
         st.subheader("Best Price Board (Player Props)")
         st.dataframe(
             best[
-                ["Event", "Player", "Side", "Line", "Best Price", "Best Book", "PosBucket", "P_used", "Best Implied", "EV", "Kelly %", "Stake $"]
+                ["Event", "Player", "Side", "Line", "Best Price", "Best Book", "PosBucket", "P_used", "Best Implied", "EV"]
             ],
             use_container_width=True,
         )
@@ -590,7 +550,7 @@ else:
         )
 
 # -----------------------------
-# SETUP HELP (FIXED: properly closed triple quotes)
+# SETUP HELP (FIXED triple-quote)
 # -----------------------------
 with tabs[2]:
     st.subheader("Setup Help")
@@ -617,20 +577,11 @@ Props are fetched **event-by-event** and **one market at a time**, which avoids 
 
 ---
 
-### 3) “Real” probabilities without uploads
+### 3) EV and ranking without uploads
 Because you requested **no dependency on uploads**, the app uses:
-- Baseline true probability = **average implied probability across books** for the same player/side/line
-- A small position-bucket adjustment (QB vs RB vs WR/TE) to break ties and add conservative signal
+- Baseline true probability = **average implied probability across books** for the same selection
+- Small position-bucket adjustment (QB vs RB vs WR/TE) to add conservative signal
 
-This keeps EV ranking stable, without requiring external datasets.
-
----
-
-### 4) Kelly sizing
-Kelly stake is computed from:
-- your chosen bankroll
-- American odds
-- probability estimate (P_used)
-- half-Kelly by default, with a cap to control risk
+This keeps EV ranking stable without external datasets.
 """
     )

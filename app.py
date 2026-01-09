@@ -1,145 +1,133 @@
 import streamlit as st
-import requests
 import pandas as pd
-from datetime import datetime
+import requests
+import logging
 
 # ------------------------
-# CONFIG
+# SETUP
 # ------------------------
-st.set_page_config(page_title="EdgeLedger — Game Lines + Player Props", layout="wide")
+st.set_page_config(page_title="EdgeLedger", layout="wide")
+logging.basicConfig(level=logging.DEBUG)
 
-# Load API key from secrets
+# Load API key
 API_KEY = st.secrets.get("ODDS_API_KEY")
 if not API_KEY:
-    st.error("API key not found. Please add it to Streamlit secrets.")
+    st.error("API_KEY not found in Streamlit secrets.")
     st.stop()
-st.sidebar.write("DEBUG: API_KEY loaded successfully")
+logging.debug("DEBUG: API_KEY loaded successfully")
 
 # ------------------------
-# UI: Sport + Scope + Player Prop Type
+# SPORT + SCOPE SELECTION
 # ------------------------
-sport_options = {
+SPORT_OPTIONS = {
     "NFL": "americanfootball_nfl",
-    "CFB": "americanfootball_ncaaf",
+    "CFB": "americanfootball_college",
     "UFC": "mma_ufc"
 }
-sport_name = st.sidebar.selectbox("Sport", list(sport_options.keys()))
-sport_key = sport_options[sport_name]
 
-scope_options = ["Game Lines", "Player Props"]
-scope = st.sidebar.selectbox("Scope", scope_options)
+sport_name = st.selectbox("Sport", list(SPORT_OPTIONS.keys()))
+sport_key = SPORT_OPTIONS[sport_name]
 
+scope = st.radio("Scope", ["Game Lines", "Player Props"])
+
+# Player prop type dropdown (only for NFL/CFB)
+PLAYER_PROP_OPTIONS = {
+    "NFL": ["passing", "rushing", "receiving", "touchdowns"],
+    "CFB": ["passing", "rushing", "receiving", "touchdowns"],
+    "UFC": []
+}
 player_prop_type = None
-if scope == "Player Props" and sport_name in ["NFL", "CFB"]:
-    player_prop_type = st.sidebar.selectbox(
-        "Player Prop Type",
-        ["passing", "rushing", "receiving", "touchdowns"]
-    )
-
-st.write(f"DEBUG: Using sport_key={sport_key}, scope={scope}, player_prop_type={player_prop_type}")
+if scope == "Player Props" and PLAYER_PROP_OPTIONS[sport_name]:
+    player_prop_type = st.selectbox("Player Prop Type", PLAYER_PROP_OPTIONS[sport_name])
 
 # ------------------------
-# API CALL
+# API REQUEST
 # ------------------------
-def fetch_odds(sport_key, markets):
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+def fetch_odds(sport_key, scope, player_prop_type=None):
+    base_url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+    markets = []
+
+    if scope == "Game Lines":
+        markets = ["h2h", "spreads", "totals"]
+    elif scope == "Player Props":
+        markets = [f"player_props:{player_prop_type}"]
+
     params = {
         "apiKey": API_KEY,
         "regions": "us",
         "markets": ",".join(markets),
         "oddsFormat": "american"
     }
-    r = requests.get(url, params=params)
+
+    logging.debug(f"DEBUG: Using sport_key={sport_key}, scope={scope}, player_prop_type={player_prop_type}")
+    logging.debug(f"DEBUG: Requesting markets: {markets}")
+
+    r = requests.get(base_url, params=params)
     r.raise_for_status()
-    return r.json()
-
-# Determine which markets to request
-markets = []
-if scope == "Game Lines":
-    markets = ["h2h", "spreads", "totals"]
-elif scope == "Player Props":
-    markets = ["player_props"]
-
-st.write(f"DEBUG: Requesting markets: {markets}")
-
-try:
-    data = fetch_odds(sport_key, markets)
-except requests.HTTPError as e:
-    st.error(f"API request failed: {e}")
-    st.stop()
-
-st.write(f"DEBUG: API returned {len(data)} events for {sport_name}")
+    data = r.json()
+    logging.debug(f"DEBUG: API returned {len(data)} events for {sport_name}")
+    return data
 
 # ------------------------
-# HELPER FUNCTIONS
+# DATA NORMALIZATION
 # ------------------------
-def american_to_prob(odds):
-    """Convert American odds to true implied probability"""
-    if odds > 0:
-        return 100 / (odds + 100)
-    else:
-        return -odds / (-odds + 100)
-
-def normalize_bookmakers(event, scope, player_prop_type=None):
+def normalize_data(events):
     rows = []
-    for book in event.get("bookmakers", []):
-        for market in book.get("markets", []):
-            # Skip irrelevant player props
-            if scope == "Player Props" and player_prop_type:
-                if player_prop_type not in market.get("key", ""):
-                    continue
-            for outcome in market.get("outcomes", []):
-                price = outcome.get("price")
-                prob = american_to_prob(price) if price else None
-                row = {
-                    "Event": f"{event.get('away_team')} @ {event.get('home_team')}",
-                    "Commence": event.get("commence_time"),
-                    "Market": market.get("key"),
-                    "Outcome": outcome.get("name"),
-                    "Price": price,
-                    "Implied Prob": prob,
-                    "Bookmaker": book.get("title")
-                }
-                rows.append(row)
-    return rows
+    for event in events:
+        event_name = event.get("home_team", "") + " vs " + event.get("away_team", "")
+        if "bookmakers" not in event or not event["bookmakers"]:
+            continue
 
-# ------------------------
-# NORMALIZE DATA
-# ------------------------
-all_rows = []
-for event in data:
-    rows = normalize_bookmakers(event, scope, player_prop_type)
-    if rows:
-        all_rows.extend(rows)
-
-if not all_rows:
-    st.warning("No normalized data available for selected filters.")
-    st.stop()
-
-df = pd.DataFrame(all_rows)
+        for bookmaker in event["bookmakers"]:
+            for market in bookmaker["markets"]:
+                for outcome in market.get("outcomes", []):
+                    price = outcome.get("price")
+                    if price is None:
+                        continue
+                    # Calculate implied probability and EV
+                    implied_prob = 100 / (price if price > 0 else 1)
+                    ev = implied_prob - 0.5  # simple EV metric (can adjust as needed)
+                    rows.append({
+                        "Event": event_name,
+                        "Market": market.get("key"),
+                        "Outcome": outcome.get("name"),
+                        "Price": price,
+                        "Bookmaker": bookmaker.get("title"),
+                        "EV": ev
+                    })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.warning("No normalized data available.")
+    return df
 
 # ------------------------
 # BEST BOOKMAKER HIGHLIGHT
 # ------------------------
-def highlight_best(row, df):
-    """Mark best bookmaker per outcome (highest price for positive EV)"""
+def highlight_best_row(row, df):
     subset = df[(df["Event"] == row["Event"]) & (df["Outcome"] == row["Outcome"])]
-    if row["Price"] == subset["Price"].max():
-        return "background-color: #b6fcd5"  # green highlight
-    return ""
+    is_best = row["Price"] == subset["Price"].max()
+    return ["background-color: #b6fcd5" if col == "Price" and is_best else "" for col in row.index]
 
 # ------------------------
-# CALCULATE EXPECTED VALUE
+# MAIN
 # ------------------------
-df["EV"] = df["Implied Prob"] * df["Price"] - (1 - df["Implied Prob"])
-df_sorted = df.sort_values("EV", ascending=False)
+try:
+    events = fetch_odds(sport_key, scope, player_prop_type)
+    df = normalize_data(events)
 
-# Auto-rank top 2–5 bets
-top_bets = df_sorted.head(5)
+    if not df.empty:
+        # Rank top bets by EV
+        top_bets = df.sort_values("EV", ascending=False).head(10).reset_index(drop=True)
 
-# ------------------------
-# DISPLAY
-# ------------------------
-st.subheader(f"EdgeLedger — {scope} ({sport_name})")
-st.write("Top Bets Ranked by EV")
-st.dataframe(top_bets.style.applymap(lambda x: highlight_best(x, df), subset=["Price"]))
+        st.subheader(f"EdgeLedger — {scope} ({sport_name})")
+        st.write("Top Bets Ranked by EV")
+
+        st.dataframe(
+            top_bets.style.apply(lambda row: highlight_best_row(row, df), axis=1)
+        )
+except requests.exceptions.HTTPError as e:
+    st.error(f"HTTPError: {e}")
+    logging.error(f"HTTPError: {e}")
+except Exception as e:
+    st.error(f"This app has encountered an error. Check logs for details.")
+    logging.exception("Unhandled Exception")

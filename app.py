@@ -47,19 +47,29 @@ def fetch_odds(sport, market):
 
 def normalize(raw):
     rows = []
+
+    if not isinstance(raw, list):
+        return rows
+
     for g in raw:
+        if not isinstance(g, dict):
+            continue
+
         for b in g.get("bookmakers", []):
+            if not isinstance(b, dict):
+                continue
+
             for m in b.get("markets", []):
                 for o in m.get("outcomes", []):
                     rows.append({
-                        "event": f"{g['away_team']} @ {g['home_team']}",
-                        "book": b["key"],
-                        "player": o.get("description"),
-                        "selection": o["name"],
+                        "game": f"{g.get('away_team')} @ {g.get('home_team')}",
+                        "book": b.get("title"),
+                        "side": o.get("name"),
                         "line": o.get("point"),
-                        "odds": o["price"]
+                        "odds": o.get("price")
                     })
-    return pd.DataFrame(rows)
+
+    return rows
 
 def project_receiving(t): return t * 0.65 * 11
 def project_rushing(c): return c * 4.4

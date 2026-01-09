@@ -2,15 +2,16 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-
-API_KEY = st.secrets["ODDS_API_KEY"]
-
-st.set_page_config(layout="wide")
-st.title("EdgeLedger — Game Lines + Player Props (Best Price)")
+from datetime import datetime
 
 # -------------------------
 # Config
 # -------------------------
+API_KEY = st.secrets["ODDS_API_KEY"]
+
+st.set_page_config(layout="wide")
+st.title("EdgeLedger — Game Lines + Player Props (Best Price + EV)")
+
 SPORT_MAP = {
     "NFL": "americanfootball_nfl",
     "CFB": "americanfootball_ncaaf",
@@ -65,7 +66,7 @@ def normalize_game(raw):
         matchup = f"{g.get('away_team')} @ {g.get('home_team')}"
         for b in g.get("bookmakers", []):
             book = b.get("title")
-            for m in b.get("markets", []):
+            for m in g.get("markets", []):
                 for o in m.get("outcomes", []):
                     rows.append({
                         "entity": matchup,
@@ -73,7 +74,8 @@ def normalize_game(raw):
                         "side": o.get("name"),
                         "line": o.get("point"),
                         "odds": o.get("price"),
-                        "book": book
+                        "book": book,
+                        "matchup": matchup
                     })
     return pd.DataFrame(rows)
 
@@ -104,7 +106,7 @@ def normalize_props(raw, event_id):
     matchup = f"{ev.get('away_team')} @ {ev.get('home_team')}"
     for b in ev.get("bookmakers", []):
         book = b.get("title")
-        for m in b.get("markets", []):
+        for m in ev.get("markets", []):
             for o in m.get("outcomes", []):
                 rows.append({
                     "entity": o.get("description", o.get("name")),
@@ -119,10 +121,29 @@ def normalize_props(raw, event_id):
 
 def best_price(df, group_cols):
     """Return best odds & book per group"""
+    if df.empty:
+        return df
     idx = df.groupby(group_cols)["odds"].idxmax()
     best = df.loc[idx].copy()
     best = best.rename(columns={"odds": "best_odds", "book": "best_book"})
     return best.reset_index(drop=True)
+
+def display_df(df, scope):
+    if df.empty:
+        st.warning("No data available.")
+        return
+    df["implied_prob"] = df["best_odds"].apply(american_to_prob)
+    df["model_prob"] = 0.52 if scope == "Game Lines" else 0.55
+    df["ev"] = (df["model_prob"] - df["implied_prob"]) * df["best_odds"].abs()
+
+    if scope == "Game Lines":
+        cols = ["matchup", "entity", "side", "line", "best_odds", "best_book", "model_prob", "implied_prob", "ev"]
+        cols = [c for c in cols if c in df.columns]
+    else:
+        cols = ["matchup", "entity", "prop_side", "line", "best_odds", "best_book", "model_prob", "implied_prob", "ev"]
+        cols = [c for c in cols if c in df.columns]
+
+    st.dataframe(df.sort_values("ev", ascending=False)[cols], use_container_width=True)
 
 # -------------------------
 # Sidebar
@@ -137,22 +158,18 @@ if scope == "Game Lines":
     market = st.sidebar.selectbox("Market", list(GAME_MARKETS.keys()))
     raw = fetch_game_odds(sport, GAME_MARKETS[market])
     df = normalize_game(raw)
+    df = best_price(df, ["entity", "market", "side"])
+    st.subheader(f"{sport} — {market} (Top Lines by EV)")
+    display_df(df, scope)
 
-    if df.empty:
-        st.warning("No game lines available.")
-    else:
-        df = best_price(df, ["entity", "market", "side"])
-        df["implied_prob"] = df["best_odds"].apply(american_to_prob)
-        df["model_prob"] = 0.52
-        df["ev"] = (df["model_prob"] - df["implied_prob"]) * df["best_odds"].abs()
-
-        st.subheader(f"{sport} — {market} (Top Lines by EV)")
-        st.dataframe(
-            df.sort_values("ev", ascending=False)[
-                ["matchup", "entity", "side", "line", "best_odds", "best_book", "model_prob", "implied_prob", "ev"]
-            ],
-            use_container_width=True
-        )
+    # -------------------------
+    # Auto-Ranking Top 2-5 Bets
+    # -------------------------
+    if not df.empty:
+        top_n = min(max(2, int(len(df) * 0.1)), 5)  # ensure 2-5
+        auto_bets = df.sort_values("ev", ascending=False).head(top_n)
+        st.subheader(f"Auto-Ranked Top {top_n} Game Lines by EV")
+        display_df(auto_bets, scope)
 
 # -------------------------
 # Player Props
@@ -169,19 +186,15 @@ else:
 
     raw = fetch_event_odds(sport, event_id, PLAYER_PROP_MARKETS)
     df = normalize_props(raw, event_id)
+    df = best_price(df, ["entity", "market", "prop_side", "line"])
+    st.subheader(f"{sport} — Player Props — {selected_event} (Top by EV)")
+    display_df(df, scope)
 
-    if df.empty:
-        st.warning("No player props found for this event.")
-    else:
-        df = best_price(df, ["entity", "market", "prop_side", "line"])
-        df["implied_prob"] = df["best_odds"].apply(american_to_prob)
-        df["model_prob"] = 0.55
-        df["ev"] = (df["model_prob"] - df["implied_prob"]) * df["best_odds"].abs()
-
-        st.subheader(f"{sport} — Player Props — {selected_event} (Top by EV)")
-        st.dataframe(
-            df.sort_values("ev", ascending=False)[
-                ["matchup", "entity", "prop_side", "line", "best_odds", "best_book", "model_prob", "implied_prob", "ev"]
-            ],
-            use_container_width=True
-        )
+    # -------------------------
+    # Auto-Ranking Top 2-5 Bets
+    # -------------------------
+    if not df.empty:
+        top_n = min(max(2, int(len(df) * 0.1)), 5)  # 2-5 props
+        auto_bets = df.sort_values("ev", ascending=False).head(top_n)
+        st.subheader(f"Auto-Ranked Top {top_n} Player Props by EV")
+        display_df(auto_bets, scope)

@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
 import requests
+import numpy as np
 
-st.title("🏈 Game Lines")
+st.title("🏈 Game Lines — Best Price & EV")
 
 # -----------------------------
 # User Controls
@@ -36,14 +37,33 @@ params = {
 }
 
 # -----------------------------
+# Helper Functions
+# -----------------------------
+def american_to_implied(odds):
+    if odds > 0:
+        return 100 / (odds + 100)
+    else:
+        return abs(odds) / (abs(odds) + 100)
+
+def implied_to_decimal(odds):
+    if odds > 0:
+        return (odds / 100) + 1
+    else:
+        return (100 / abs(odds)) + 1
+
+def expected_value(model_p, odds):
+    dec = implied_to_decimal(odds)
+    return round((model_p * dec) - 1, 3)
+
+# -----------------------------
 # Fetch Data
 # -----------------------------
 try:
-    response = requests.get(url, params=params, timeout=10)
-    response.raise_for_status()
-    games = response.json()
-except Exception as e:
-    st.error("Failed to load odds data")
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    games = r.json()
+except Exception:
+    st.error("Failed to load odds")
     st.stop()
 
 # -----------------------------
@@ -61,27 +81,61 @@ for game in games:
         for market_data in book.get("markets", []):
             for outcome in market_data.get("outcomes", []):
                 rows.append({
-                    "Sport": sport,
-                    "Book": book_name,
-                    "Home Team": home,
-                    "Away Team": away,
+                    "Matchup": f"{away} @ {home}",
                     "Side": outcome.get("name"),
                     "Line": outcome.get("point"),
-                    "Odds": outcome.get("price")
+                    "Odds": outcome.get("price"),
+                    "Book": book_name
                 })
 
 df = pd.DataFrame(rows)
 
-# -----------------------------
-# Display
-# -----------------------------
 if df.empty:
     st.warning("No odds available")
-else:
-    st.subheader("Live Odds")
-    st.dataframe(
-        df.sort_values("Odds"),
-        use_container_width=True
-    )
+    st.stop()
 
-    st.caption("Live odds powered by The Odds API")
+# -----------------------------
+# Best Price Per Side
+# -----------------------------
+best = (
+    df.sort_values("Odds", ascending=False)
+      .groupby(["Matchup", "Side", "Line"], as_index=False)
+      .first()
+)
+
+# -----------------------------
+# Model Probability (Placeholder)
+# Replace later with efficiency metrics
+# -----------------------------
+np.random.seed(42)
+best["Model_Prob"] = np.clip(
+    np.random.normal(0.52, 0.04, len(best)),
+    0.45,
+    0.65
+)
+
+best["Implied_Prob"] = best["Odds"].apply(american_to_implied)
+best["EV"] = best.apply(lambda r: expected_value(r["Model_Prob"], r["Odds"]), axis=1)
+
+best["Decision"] = np.where(best["EV"] > 0, "BET", "NO BET")
+
+# -----------------------------
+# Display Top 25 by EV
+# -----------------------------
+st.subheader("📈 Top 25 Bets by Expected Value")
+
+top = (
+    best.sort_values("EV", ascending=False)
+        .head(25)
+        .reset_index(drop=True)
+)
+
+st.dataframe(
+    top.style.applymap(
+        lambda x: "background-color: #d4f7d4" if isinstance(x, float) and x > 0 else ""
+    ),
+    use_container_width=True
+)
+
+st.caption("EV calculated using best available price across books")
+

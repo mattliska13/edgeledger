@@ -54,7 +54,7 @@ st.caption("Game lines + player props â€¢ Best price across DraftKings/FanDuel â
 # Secrets / API Key
 # ----------------------------
 # Prefer Streamlit secrets, fallback to env var, fallback to hard-coded (your provided key)
-DEFAULT_KEY = "6a5d08e7c2407da6fb95b86ad9619bf0"
+DEFAULT_KEY = "d1a096c07dfb711c63560fcc7495fd0d"
 API_KEY = None
 
 try:

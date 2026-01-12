@@ -7,7 +7,7 @@ import numpy as np
 import streamlit as st
 
 # =============================
-# Page + Theme polish
+# Page + Visual polish
 # =============================
 st.set_page_config(page_title="Dashboard", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
@@ -15,11 +15,12 @@ st.markdown(
     """
     <style>
       .block-container { padding-top: 1.1rem; }
-      [data-testid="stSidebarNav"] { display: none; } /* hides multipage nav */
-      .big-title { font-size: 2.0rem; font-weight: 800; letter-spacing: -0.02em; }
+      [data-testid="stSidebarNav"] { display: none; } /* hide multipage nav */
+      .big-title { font-size: 2.0rem; font-weight: 800; letter-spacing: -0.02em; margin: 0 0 0.35rem 0; }
       .subtle { color: rgba(250,250,250,0.75); }
-      .pill { display:inline-block; padding:0.2rem 0.6rem; border-radius:999px; background:rgba(255,255,255,0.08); margin-right:0.4rem; }
-      .metric-card { padding: 0.75rem 1rem; border-radius: 16px; background: rgba(255,255,255,0.06); }
+      .pill { display:inline-block; padding:0.18rem 0.55rem; border-radius:999px; background:rgba(255,255,255,0.08); margin-right:0.4rem; }
+      .card { padding: 0.9rem 1rem; border-radius: 18px; background: rgba(255,255,255,0.06); }
+      hr { border-color: rgba(255,255,255,0.08); }
     </style>
     """,
     unsafe_allow_html=True,
@@ -56,19 +57,20 @@ GAME_LINE_MARKETS = {
     "Totals": "totals",
 }
 
+# ✅ Correct Odds API market keys for NFL/CFB props (DK/FD)
 PLAYER_PROP_MARKETS = {
     "Anytime TD": "player_anytime_td",
-    "Passing Yards": "player_passing_yds",
+    "Passing Yards": "player_pass_yds",
     "Pass TDs": "player_pass_tds",
-    "Rushing Yards": "player_rushing_yds",
-    "Receiving Yards": "player_receiving_yds",
+    "Rushing Yards": "player_rush_yds",
+    "Receiving Yards": "player_reception_yds",
     "Receptions": "player_receptions",
 }
 
 DG_BASE = "https://feeds.datagolf.com"
 
 # =============================
-# Utility + Debug
+# Helpers
 # =============================
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -84,7 +86,6 @@ def safe_get(url, params=None, timeout=20):
         r = requests.get(url, params=params or {}, timeout=timeout)
         return r
     except Exception as e:
-        # Fake a response-like object for safe downstream handling
         class _R:
             status_code = 0
             headers = {}
@@ -103,42 +104,58 @@ def american_to_implied(odds: float) -> float:
         return 100.0 / (odds + 100.0)
     return (-odds) / ((-odds) + 100.0)
 
+def clamp01(x):
+    return np.clip(x, 0.001, 0.999)
+
+def pct(x):
+    """0-1 -> 0-100"""
+    return x * 100.0
+
 # =============================
-# EV + Best price (FIXED / BULLETPROOF)
+# EV + Best price (FIXED: no merge)
 # =============================
 def compute_ev_from_market_avg(df: pd.DataFrame, group_cols: list):
     """
-    Adds: Implied, MarketProb, ModelProb, EV
-    ModelProb defaults to MarketProb (market-average implied).
+    Adds:
+      - Implied (per row)
+      - MarketProb (mean implied across books for the selection)  ✅ uses transform (no merge)
+      - ModelProb (defaults to MarketProb)
+      - EV = (ModelProb - Implied)*100
     """
     if df.empty:
         return df
 
     df = df.copy()
+
+    # Ensure numeric
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
     df = df.dropna(subset=["Price"])
 
+    # Normalize group cols to avoid dtype issues (Line often causes problems)
+    for c in group_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+        # Use string representation for stable grouping keys (prevents merge dtype mismatch entirely)
+        df[c] = df[c].astype("string")
+
     df["Implied"] = df["Price"].apply(american_to_implied)
+    df["Implied"] = pd.to_numeric(df["Implied"], errors="coerce").fillna(0.5)
+    df["Implied"] = clamp01(df["Implied"])
 
-    avg = (
-        df.groupby(group_cols, dropna=False)["Implied"]
-        .mean()
-        .reset_index()
-        .rename(columns={"Implied": "MarketProb"})
-    )
-    df = df.merge(avg, on=group_cols, how="left")
+    # ✅ NO MERGE: transform avoids ValueError from dtype mismatch
+    df["MarketProb"] = df.groupby(group_cols, dropna=False)["Implied"].transform("mean")
+    df["MarketProb"] = pd.to_numeric(df["MarketProb"], errors="coerce").fillna(df["Implied"])
+    df["MarketProb"] = clamp01(df["MarketProb"])
 
+    # Baseline model prob: market avg (you can replace later with projections)
     df["ModelProb"] = df["MarketProb"]
-    df["ModelProb"] = pd.to_numeric(df["ModelProb"], errors="coerce").clip(0.001, 0.999)
-    df["Implied"] = pd.to_numeric(df["Implied"], errors="coerce").clip(0.001, 0.999)
 
     df["EV"] = (df["ModelProb"] - df["Implied"]) * 100.0
     return df
 
 def best_price_group(df: pd.DataFrame, group_cols: list, odds_col="Price"):
     """
-    Picks the best American odds (max) within each selection group.
-    Keeps MarketProb/ModelProb if they exist (because we select from df rows).
+    Picks best American odds (max) within each selection group.
     """
     if df.empty:
         return df
@@ -147,57 +164,55 @@ def best_price_group(df: pd.DataFrame, group_cols: list, odds_col="Price"):
     df[odds_col] = pd.to_numeric(df[odds_col], errors="coerce")
     df = df.dropna(subset=[odds_col])
 
+    # group_cols are already string-normalized in compute_ev_from_market_avg
     idx = df.groupby(group_cols, dropna=False)[odds_col].idxmax()
     best = df.loc[idx].copy()
 
     best = best.rename(columns={"Book": "Best Book", odds_col: "Best Price"})
     return best
 
-def ensure_probs_for_ev(df_best: pd.DataFrame, group_cols: list, df_full: pd.DataFrame | None = None):
+def ensure_probs_for_ev(df_best: pd.DataFrame):
     """
-    Ensures df_best has MarketProb and ModelProb; prevents KeyError forever.
+    Bulletproof: guarantees ModelProb/Implied exist.
     """
     if df_best.empty:
         return df_best
 
     df_best = df_best.copy()
 
-    # If we can merge missing columns from df_full (recommended)
-    if df_full is not None and not df_full.empty:
-        need = []
-        for c in ["MarketProb", "ModelProb"]:
-            if c not in df_best.columns and c in df_full.columns:
-                need.append(c)
-        if need:
-            src = df_full[group_cols + need].drop_duplicates(group_cols)
-            df_best = df_best.merge(src, on=group_cols, how="left")
-
-    # Ensure Implied exists from Best Price
-    df_best["Implied"] = pd.to_numeric(df_best.get("Best Price"), errors="coerce").apply(american_to_implied)
-
-    if "MarketProb" not in df_best.columns:
-        df_best["MarketProb"] = df_best["Implied"]
+    df_best["Best Price"] = pd.to_numeric(df_best["Best Price"], errors="coerce")
+    df_best["Implied"] = df_best["Best Price"].apply(american_to_implied)
+    df_best["Implied"] = pd.to_numeric(df_best["Implied"], errors="coerce").fillna(0.5)
+    df_best["Implied"] = clamp01(df_best["Implied"])
 
     if "ModelProb" not in df_best.columns:
-        df_best["ModelProb"] = df_best["MarketProb"]
-
-    df_best["ModelProb"] = pd.to_numeric(df_best["ModelProb"], errors="coerce").fillna(df_best["Implied"]).clip(0.001, 0.999)
-    df_best["Implied"] = pd.to_numeric(df_best["Implied"], errors="coerce").fillna(0.5).clip(0.001, 0.999)
+        df_best["ModelProb"] = df_best.get("MarketProb", df_best["Implied"])
+    df_best["ModelProb"] = pd.to_numeric(df_best["ModelProb"], errors="coerce").fillna(df_best["Implied"])
+    df_best["ModelProb"] = clamp01(df_best["ModelProb"])
 
     df_best["EV"] = (df_best["ModelProb"] - df_best["Implied"]) * 100.0
     return df_best
 
-def enforce_no_contradictions(df_best: pd.DataFrame, contradiction_key_cols: list):
+def enforce_no_contradictions(df_best: pd.DataFrame, key_cols: list):
     """
-    Keeps ONLY the best EV per contradiction group so we never recommend both sides.
+    Keeps only the top EV row per contradiction group to avoid both sides being recommended.
     """
     if df_best.empty:
         return df_best
-
     df = df_best.copy()
     df["EV"] = pd.to_numeric(df["EV"], errors="coerce").fillna(-1e9)
-    keep_idx = df.groupby(contradiction_key_cols, dropna=False)["EV"].idxmax()
+    keep_idx = df.groupby(key_cols, dropna=False)["EV"].idxmax()
     return df.loc[keep_idx].sort_values("EV", ascending=False)
+
+def display_with_percents(df: pd.DataFrame, prob_cols=("ModelProb", "Implied", "MarketProb")):
+    """
+    Adds percent columns for display only (keeps original numeric for logic).
+    """
+    out = df.copy()
+    for c in prob_cols:
+        if c in out.columns:
+            out[c + "_pct"] = pct(pd.to_numeric(out[c], errors="coerce").fillna(np.nan))
+    return out
 
 # =============================
 # Odds API — Game lines (cached)
@@ -240,7 +255,6 @@ def normalize_game_lines(raw):
                             "Book": book,
                         }
                     )
-
     df = pd.DataFrame(rows)
     if df.empty:
         return df
@@ -248,7 +262,7 @@ def normalize_game_lines(raw):
     return df
 
 # =============================
-# Odds API — Player props (2-step events -> event odds)
+# Odds API — Player props (2-step: events -> event odds)
 # =============================
 @st.cache_data(ttl=60 * 60)  # 1 hour cache
 def fetch_events(sport_key: str):
@@ -286,8 +300,9 @@ def normalize_player_props(event_payload):
         for mk in bm.get("markets", []) or []:
             mkey = mk.get("key")
             for out in mk.get("outcomes", []) or []:
+                # Depending on market, the Odds API outcome fields vary
                 player = out.get("name")
-                side = out.get("description") or out.get("name")
+                side = out.get("description") or out.get("name")  # often "Over/Under" in description
                 line = out.get("point")
                 price = out.get("price")
 
@@ -339,7 +354,6 @@ def normalize_datagolf(pred_payload, skill_payload=None):
     if not isinstance(pred_payload, dict):
         return pd.DataFrame()
 
-    # Find biggest list-like table
     list_keys = [k for k, v in pred_payload.items() if isinstance(v, list) and (len(v) == 0 or isinstance(v[0], dict))]
     if not list_keys:
         return pd.DataFrame()
@@ -349,39 +363,24 @@ def normalize_datagolf(pred_payload, skill_payload=None):
     if df.empty:
         return df
 
-    # Player name
     name_col = "player_name" if "player_name" in df.columns else ("player" if "player" in df.columns else None)
     if name_col:
         df = df.rename(columns={name_col: "Player"})
     else:
         df["Player"] = "Unknown"
 
-    # Prob columns heuristics
     win_col = None
     top10_col = None
     for c in df.columns:
         lc = c.lower()
-        if ("course" in lc or "fit" in lc) and "win" in lc:
+        if win_col is None and "win" in lc:
             win_col = c
-        if ("course" in lc or "fit" in lc) and ("top_10" in lc or "top10" in lc):
+        if top10_col is None and ("top_10" in lc or "top10" in lc):
             top10_col = c
-
-    if not win_col:
-        for c in df.columns:
-            if "win" in c.lower():
-                win_col = c
-                break
-
-    if not top10_col:
-        for c in df.columns:
-            if "top_10" in c.lower() or "top10" in c.lower():
-                top10_col = c
-                break
 
     df["Win%"] = pd.to_numeric(df[win_col], errors="coerce") if win_col else np.nan
     df["Top10%"] = pd.to_numeric(df[top10_col], errors="coerce") if top10_col else np.nan
 
-    # Skill merge (SG T2G + Putting where possible)
     if isinstance(skill_payload, dict):
         sk_list = None
         for _, v in skill_payload.items():
@@ -398,19 +397,8 @@ def normalize_datagolf(pred_payload, skill_payload=None):
                 putt_col = cols.get("sg_putt") or cols.get("sg_putting") or cols.get("putting")
                 t2g_col = cols.get("sg_t2g") or cols.get("t2g")
 
-                ott_col = cols.get("sg_ott") or cols.get("ott") or cols.get("off_the_tee")
-                app_col = cols.get("sg_app") or cols.get("approach") or cols.get("app")
-                arg_col = cols.get("sg_arg") or cols.get("around_green") or cols.get("arg")
-
                 sk["SG_Putt"] = pd.to_numeric(sk[putt_col], errors="coerce") if putt_col else np.nan
-                if t2g_col:
-                    sk["SG_T2G"] = pd.to_numeric(sk[t2g_col], errors="coerce")
-                else:
-                    parts = []
-                    for cc in [ott_col, app_col, arg_col]:
-                        if cc:
-                            parts.append(pd.to_numeric(sk[cc], errors="coerce"))
-                    sk["SG_T2G"] = np.nan if not parts else np.nanmean(np.vstack([p.to_numpy() for p in parts]), axis=0)
+                sk["SG_T2G"] = pd.to_numeric(sk[t2g_col], errors="coerce") if t2g_col else np.nan
 
                 df = df.merge(sk[["Player", "SG_T2G", "SG_Putt"]].drop_duplicates("Player"), on="Player", how="left")
 
@@ -474,20 +462,21 @@ if section == "Game Lines":
         st.warning("No rows for this market right now.")
         st.stop()
 
-    group_cols = ["Event", "Market", "Side"] + (["Line"] if market_key in ["totals", "spreads"] else [])
+    group_cols = ["Event", "Market", "Side"]
+    if market_key in ["totals", "spreads"]:
+        group_cols += ["Line"]
 
     df_ev = compute_ev_from_market_avg(df, group_cols=group_cols)
     df_best = best_price_group(df_ev, group_cols=group_cols, odds_col="Price")
+    df_best = ensure_probs_for_ev(df_best)
 
-    # ✅ FIX: ensures ModelProb exists (prevents KeyError)
-    df_best = ensure_probs_for_ev(df_best, group_cols=group_cols, df_full=df_ev)
-
-    # No-contradiction
+    # No-contradiction rules
     if market_key == "totals":
         df_best = enforce_no_contradictions(df_best, ["Event", "Market", "Line"])
     else:
         df_best = enforce_no_contradictions(df_best, ["Event", "Market"])
 
+    # Auto top 2–5
     n_top = int(np.clip(len(df_best), 2, 5))
     top_bets = df_best.sort_values("EV", ascending=False).head(n_top).copy()
     top_bets["⭐ Best Book"] = "⭐ " + top_bets["Best Book"].astype(str)
@@ -495,14 +484,23 @@ if section == "Game Lines":
     st.subheader(f"{sport} — {market_label}")
     st.markdown("### Top Bets Ranked by EV")
 
-    cols = ["Event", "Side"] + (["Line"] if "Line" in top_bets.columns else []) + ["Best Price", "⭐ Best Book", "ModelProb", "Implied", "EV"]
-    st.dataframe(top_bets[cols], use_container_width=True)
+    top_disp = display_with_percents(top_bets)
+    cols = ["Event", "Side"] + (["Line"] if "Line" in top_disp.columns else []) + ["Best Price", "⭐ Best Book", "ModelProb_pct", "Implied_pct", "EV"]
+    cols = [c for c in cols if c in top_disp.columns]
+    st.dataframe(top_disp[cols], use_container_width=True)
+
+    st.markdown("### EV Bar Chart (Top Bets)")
+    chart_df = top_disp[["Event", "EV"]].copy()
+    chart_df = chart_df.set_index("Event")
+    st.bar_chart(chart_df)
 
     st.markdown("### Snapshot — Top 25 (by EV)")
     snap = df_best.sort_values("EV", ascending=False).head(25).copy()
     snap["⭐ Best Book"] = "⭐ " + snap["Best Book"].astype(str)
-    cols2 = ["Event", "Side"] + (["Line"] if "Line" in snap.columns else []) + ["Best Price", "⭐ Best Book", "ModelProb", "Implied", "EV"]
-    st.dataframe(snap[cols2], use_container_width=True)
+    snap_disp = display_with_percents(snap)
+    cols2 = ["Event", "Side"] + (["Line"] if "Line" in snap_disp.columns else []) + ["Best Price", "⭐ Best Book", "ModelProb_pct", "Implied_pct", "EV"]
+    cols2 = [c for c in cols2 if c in snap_disp.columns]
+    st.dataframe(snap_disp[cols2], use_container_width=True)
 
 elif section == "Player Props":
     sport_key = SPORT_KEYS[sport]
@@ -544,29 +542,33 @@ elif section == "Player Props":
 
     if not all_props:
         st.warning(
-            "No player props were returned for this prop type from DraftKings/FanDuel for the scanned events.\n\n"
-            "This usually means the market isn't posted yet for those events/books."
+            "No player props returned from DraftKings/FanDuel for the scanned events.\n\n"
+            "Try a different prop type (or scan more events)."
         )
         st.stop()
 
     df = pd.concat(all_props, ignore_index=True)
 
-    # Ensure player-based outcomes
+    # Keep player-based outcomes; drop obvious junk
     df["Player"] = df["Player"].astype(str)
-    df = df[~df["Player"].str.lower().isin(["over", "under"])].dropna(subset=["Price"])
+    df["Side"] = df["Side"].astype(str)
+    df = df.dropna(subset=["Price"])
+    df = df[df["Player"].str.len() > 1]
 
-    group_cols = ["Event", "Market", "Player", "Side"] + (["Line"] if "Line" in df.columns else [])
+    # Grouping for prop selections
+    group_cols = ["Event", "Market", "Player", "Side"]
+    if "Line" in df.columns:
+        group_cols += ["Line"]
 
     df_ev = compute_ev_from_market_avg(df, group_cols=group_cols)
     df_best = best_price_group(df_ev, group_cols=group_cols, odds_col="Price")
+    df_best = ensure_probs_for_ev(df_best)
 
-    # ✅ FIX: ensures ModelProb exists (prevents KeyError)
-    df_best = ensure_probs_for_ev(df_best, group_cols=group_cols, df_full=df_ev)
-
-    # No-contradictions: keep only best EV per player+line+market
+    # ✅ No-contradictions (keep only best EV per player+line)
     contradiction_cols = ["Event", "Market", "Player"] + (["Line"] if "Line" in df_best.columns else [])
     df_best = enforce_no_contradictions(df_best, contradiction_cols)
 
+    # Auto top 2–5
     n_top = int(np.clip(len(df_best), 2, 5))
     top_bets = df_best.sort_values("EV", ascending=False).head(n_top).copy()
     top_bets["⭐ Best Book"] = "⭐ " + top_bets["Best Book"].astype(str)
@@ -575,14 +577,24 @@ elif section == "Player Props":
     st.caption(f"Prop Type: {prop_label} • Scanned events: {len(event_ids)} • Normalized props: {len(df_best)}")
 
     st.markdown("### Top Bets Ranked by EV (No Contradictions)")
-    cols = ["Event", "Player", "Side"] + (["Line"] if "Line" in top_bets.columns else []) + ["Best Price", "⭐ Best Book", "ModelProb", "Implied", "EV"]
-    st.dataframe(top_bets[cols], use_container_width=True)
+    top_disp = display_with_percents(top_bets)
+    cols = ["Event", "Player", "Side"] + (["Line"] if "Line" in top_disp.columns else []) + ["Best Price", "⭐ Best Book", "ModelProb_pct", "Implied_pct", "EV"]
+    cols = [c for c in cols if c in top_disp.columns]
+    st.dataframe(top_disp[cols], use_container_width=True)
+
+    st.markdown("### Model vs Implied (Top Bets) — Percent")
+    # chart: percent columns (display only)
+    chart_df = top_disp[["Player", "ModelProb_pct", "Implied_pct"]].copy()
+    chart_df = chart_df.set_index("Player")
+    st.bar_chart(chart_df)
 
     st.markdown("### Snapshot — Top 25 (by EV)")
     snap = df_best.sort_values("EV", ascending=False).head(25).copy()
     snap["⭐ Best Book"] = "⭐ " + snap["Best Book"].astype(str)
-    cols2 = ["Event", "Player", "Side"] + (["Line"] if "Line" in snap.columns else []) + ["Best Price", "⭐ Best Book", "ModelProb", "Implied", "EV"]
-    st.dataframe(snap[cols2], use_container_width=True)
+    snap_disp = display_with_percents(snap)
+    cols2 = ["Event", "Player", "Side"] + (["Line"] if "Line" in snap_disp.columns else []) + ["Best Price", "⭐ Best Book", "ModelProb_pct", "Implied_pct", "EV"]
+    cols2 = [c for c in cols2 if c in snap_disp.columns]
+    st.dataframe(snap_disp[cols2], use_container_width=True)
 
 else:
     st.subheader("PGA — Picks (Win + Top-10)")

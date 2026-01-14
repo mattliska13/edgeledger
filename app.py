@@ -63,8 +63,13 @@ def get_key(name: str, default: str = "") -> str:
         return v
     return default
 
+# ODDS key
 ODDS_API_KEY = get_key("ODDS_API_KEY", "")
+
+# DATAGOLF: accept BOTH names, since you stored DATAGOLF_KEY
+DATAGOLF_KEY = get_key("DATAGOLF_KEY", "")
 DATAGOLF_API_KEY = get_key("DATAGOLF_API_KEY", "")
+DATAGOLF_FINAL = DATAGOLF_KEY or DATAGOLF_API_KEY  # use whichever is present
 
 # =========================
 # HTTP
@@ -138,7 +143,7 @@ GAME_MARKETS = {
     "Totals": "totals",
 }
 
-# Correct prop market keys (The Odds API)
+# ✅ Correct The Odds API prop market keys (per docs)
 PROP_MARKETS = {
     "Anytime TD": "player_anytime_td",
     "Passing Yards": "player_pass_yds",
@@ -158,23 +163,22 @@ st.sidebar.markdown("---")
 debug = st.sidebar.checkbox("Show debug logs", value=False)
 compact = st.sidebar.toggle("Mobile / Compact layout", value=False)
 
-# Hide PGA until key exists
 modes = ["Best Bets (All)", "Game Lines", "Player Props"]
-if DATAGOLF_API_KEY.strip():
+if DATAGOLF_FINAL.strip():
     modes.append("PGA")
 
 mode = st.sidebar.radio("Mode", modes, index=0)
 
 with st.sidebar.expander("API Keys (optional runtime entry)", expanded=False):
-    st.caption("If Secrets aren’t set, paste keys here (session-only).")
+    st.caption("Uses Streamlit Secrets first. You can paste here (session-only).")
     odds_in = st.text_input("ODDS_API_KEY", value=ODDS_API_KEY or "", type="password")
-    dg_in = st.text_input("DATAGOLF_API_KEY", value=DATAGOLF_API_KEY or "", type="password")
+    dg_in = st.text_input("DATAGOLF_KEY (or DATAGOLF_API_KEY)", value=DATAGOLF_FINAL or "", type="password")
     if odds_in.strip():
         st.session_state["ODDS_API_KEY"] = odds_in.strip()
         ODDS_API_KEY = odds_in.strip()
     if dg_in.strip():
-        st.session_state["DATAGOLF_API_KEY"] = dg_in.strip()
-        DATAGOLF_API_KEY = dg_in.strip()
+        st.session_state["DATAGOLF_KEY"] = dg_in.strip()
+        DATAGOLF_FINAL = dg_in.strip()
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("<span class='pill'>Books: DK + FD</span>", unsafe_allow_html=True)
@@ -185,14 +189,14 @@ st.sidebar.markdown(f"<span class='pill'>Updated: {now_str()}</span>", unsafe_al
 # =========================
 st.markdown("<div class='big-title'>EdgeLedger</div>", unsafe_allow_html=True)
 st.caption(
-    "Best bets = **Edge = YourProb − ImpliedProb** (American odds). "
+    "Best bets = **Edge = YourProb − ImpliedProb**. "
     "Only show bets with Edge > 0. "
-    "No contradictions anywhere (line bucketed to nearest 0.5). "
+    "No contradictions anywhere (bucket lines to nearest 0.5). "
     "DK/FD only. Separate API calls for game lines vs player props."
 )
 
 if not ODDS_API_KEY.strip():
-    st.error('Missing ODDS_API_KEY. Add it in Streamlit Secrets as ODDS_API_KEY="..." or paste it in the sidebar expander.')
+    st.error('Missing ODDS_API_KEY. Add it in Streamlit Secrets as ODDS_API_KEY="..." or paste it in the sidebar.')
     st.stop()
 
 # ==========================================================
@@ -284,7 +288,7 @@ def normalize_props(event_payload):
             mkey = mk.get("key")
             for out in (mk.get("outcomes", []) or []):
                 player = out.get("name")
-                side = out.get("description")  # Over/Under (often) or blank (ATD)
+                side = out.get("description")  # Over/Under often; blank for ATD
                 line = out.get("point")
                 price = out.get("price")
 
@@ -319,10 +323,6 @@ def add_implied(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def compute_no_vig_two_way_within_book(df: pd.DataFrame, group_cols_book: list) -> pd.DataFrame:
-    """
-    Convert implied probs to no-vig within each book for the two-way set,
-    then later we can average across books to form "YourProb" baseline.
-    """
     out = df.copy()
     out["Implied"] = clamp01(pd.to_numeric(out["Implied"], errors="coerce").fillna(0.5))
     sums = out.groupby(group_cols_book)["Implied"].transform("sum")
@@ -330,11 +330,6 @@ def compute_no_vig_two_way_within_book(df: pd.DataFrame, group_cols_book: list) 
     return out
 
 def estimate_your_prob(df: pd.DataFrame, key_cols: list, book_cols: list) -> pd.DataFrame:
-    """
-    YOUR PROBABILITY (baseline):
-    - If market is two-way within a book: compute NoVigProb and average across books.
-    - Fallback: average implied across books.
-    """
     if df.empty:
         return df.copy()
 
@@ -349,12 +344,6 @@ def estimate_your_prob(df: pd.DataFrame, key_cols: list, book_cols: list) -> pd.
     return out
 
 def best_price_and_edge(df: pd.DataFrame, group_cols_best: list) -> pd.DataFrame:
-    """
-    For each unique bet (event/market/outcome/linebucket/...):
-    - pick BEST PRICE across books
-    - compute implied from that best price
-    - Edge = YourProb - ImpliedBest
-    """
     if df.empty:
         return df.copy()
 
@@ -374,11 +363,6 @@ def best_price_and_edge(df: pd.DataFrame, group_cols_best: list) -> pd.DataFrame
     return best
 
 def prevent_contradictions(df_best: pd.DataFrame, contradiction_cols: list) -> pd.DataFrame:
-    """
-    Keep only ONE pick per contradiction group (max Edge).
-    This prevents Over/Under both showing, or both spread sides,
-    even if off by half a point due to LineBucket.
-    """
     if df_best.empty:
         return df_best
 
@@ -389,9 +373,6 @@ def prevent_contradictions(df_best: pd.DataFrame, contradiction_cols: list) -> p
     return out
 
 def keep_only_value_bets(df_best: pd.DataFrame) -> pd.DataFrame:
-    """
-    Only show +EV bets: Edge > 0
-    """
     out = df_best.copy()
     out["Edge"] = pd.to_numeric(out["Edge"], errors="coerce")
     return out[out["Edge"] > 0].sort_values("Edge", ascending=False)
@@ -418,26 +399,23 @@ def build_game_lines_board(sport: str, bet_type: str):
     if df.empty:
         return pd.DataFrame(), {"error": "No rows for selected market"}
 
-    # Keys
     key_cols = ["Event", "Market", "Outcome"]
     book_cols = ["Event", "Market", "Book"]
     best_cols = ["Event", "Market", "Outcome"]
 
-    # Use linebucket for spreads/totals
     if market_key in ["spreads", "totals"]:
         key_cols += ["LineBucket"]
         book_cols += ["LineBucket"]
         best_cols += ["LineBucket"]
-        contradiction_cols = ["Event", "Market", "LineBucket"]  # stops both sides even off by 0.5
+        contradiction_cols = ["Event", "Market", "LineBucket"]
     else:
-        contradiction_cols = ["Event", "Market"]  # moneyline: stop both teams showing
+        contradiction_cols = ["Event", "Market"]
 
     df = estimate_your_prob(df, key_cols=key_cols, book_cols=book_cols)
     df_best = best_price_and_edge(df, group_cols_best=best_cols)
     df_best = prevent_contradictions(df_best, contradiction_cols=contradiction_cols)
     df_best = keep_only_value_bets(df_best)
 
-    # Display columns
     df_best["YourProb%"] = pct01_to_100(df_best["YourProb"])
     df_best["Implied%"] = pct01_to_100(df_best["ImpliedBest"])
     df_best["Edge%"] = pct01_to_100(df_best["Edge"])
@@ -469,39 +447,47 @@ def build_props_board(sport: str, prop_label: str, max_events_scan: int = 5):
         call_log.append({"event_id": eid, "market": market_key, "status": r["status"], "ok": r["ok"]})
         if not r["ok"] or not isinstance(r["payload"], dict):
             continue
+
         dfp = normalize_props(r["payload"])
         if not dfp.empty:
-            all_rows.append(dfp)
-        time.sleep(0.08)
+            # keep only this market_key in case payload carries others
+            dfp = dfp[dfp["Market"] == market_key].copy()
+            if not dfp.empty:
+                all_rows.append(dfp)
+
+        time.sleep(0.06)
 
     if debug:
         st.json({"prop_calls": call_log})
 
     if not all_rows:
-        return pd.DataFrame(), {"error": "No props returned for DK/FD on scanned events (or market not posted yet).", "calls": call_log}
+        return pd.DataFrame(), {
+            "error": "No props returned for DK/FD on scanned events (or market not posted yet). Try another prop type or scan more events.",
+            "calls": call_log
+        }
 
     df = pd.concat(all_rows, ignore_index=True)
 
-    # Keys
+    # ---- key design for props ----
     key_cols = ["Event", "Market", "Player", "Side"]
     book_cols = ["Event", "Market", "Player", "Book"]
     best_cols = ["Event", "Market", "Player", "Side"]
 
-    # If has line, use bucket to prevent over/under contradictions even off by 0.5
-    has_line_bucket = "LineBucket" in df.columns and df["LineBucket"].notna().any()
-    if has_line_bucket:
+    # Line bucket if available (Over/Under)
+    has_lb = "LineBucket" in df.columns and df["LineBucket"].notna().any()
+    if has_lb:
         key_cols += ["LineBucket"]
         book_cols += ["LineBucket"]
         best_cols += ["LineBucket"]
         contradiction_cols = ["Event", "Market", "Player", "LineBucket"]
     else:
-        # Anytime TD etc.
+        # ATD, etc.
         contradiction_cols = ["Event", "Market", "Player"]
 
     df = estimate_your_prob(df, key_cols=key_cols, book_cols=book_cols)
     df_best = best_price_and_edge(df, group_cols_best=best_cols)
 
-    # IMPORTANT: prevent contradictions so we never show both Over and Under
+    # No contradictory picks
     df_best = prevent_contradictions(df_best, contradiction_cols=contradiction_cols)
     df_best = keep_only_value_bets(df_best)
 
@@ -541,14 +527,14 @@ if mode == "Best Bets (All)":
         colA, colB, colC = st.columns([1.2, 1.2, 1])
 
     with colA:
-        sport_lines = st.selectbox("Game Lines Sport", list(SPORT_KEYS_LINES.keys()), index=0)
-        bet_type = st.selectbox("Game Lines Bet Type", list(GAME_MARKETS.keys()), index=1)
+        sport_lines = st.selectbox("Game Lines Sport", list(SPORT_KEYS_LINES.keys()), index=0, key="gl_sport")
+        bet_type = st.selectbox("Game Lines Bet Type", list(GAME_MARKETS.keys()), index=1, key="gl_type")
     with colB:
-        sport_props = st.selectbox("Props Sport", list(SPORT_KEYS_PROPS.keys()), index=0)
-        prop_label = st.selectbox("Prop Type", list(PROP_MARKETS.keys()), index=1)
+        sport_props = st.selectbox("Props Sport", list(SPORT_KEYS_PROPS.keys()), index=0, key="pp_sport")
+        prop_label = st.selectbox("Prop Type", list(PROP_MARKETS.keys()), index=0, key="pp_type")
     with colC:
-        top_n = st.slider("Top picks overall (by Edge)", 2, 10, 5)
-        max_events_scan = st.slider("Props events to scan (usage control)", 1, 10, 5)
+        top_n = st.slider("Top picks overall (by Edge)", 2, 10, 5, key="top_overall")
+        max_events_scan = st.slider("Props events to scan (usage control)", 1, 10, 5, key="scan_n")
 
     df_lines, errL = build_game_lines_board(sport_lines, bet_type)
     df_props, errP = build_props_board(sport_props, prop_label, max_events_scan=max_events_scan)
@@ -566,7 +552,6 @@ if mode == "Best Bets (All)":
         x["Pick"] = x["Outcome"].astype(str)
         x["Entity"] = x["Event"].astype(str)
         x["Bucket"] = x.get("LineBucket", "")
-        # global contradiction key for lines
         x["ContrKey"] = x["Scope"] + "|" + x["Event"] + "|" + x["Market"] + "|" + x["Bucket"].astype(str)
         combined.append(x)
 
@@ -576,7 +561,6 @@ if mode == "Best Bets (All)":
         x["Pick"] = (x["Player"].astype(str) + " " + x["Side"].astype(str)).str.strip()
         x["Entity"] = x["Event"].astype(str)
         x["Bucket"] = x.get("LineBucket", "")
-        # global contradiction key for props (player-specific)
         x["ContrKey"] = x["Scope"] + "|" + x["Event"] + "|" + x["Market"] + "|" + x["Player"].astype(str) + "|" + x["Bucket"].astype(str)
         combined.append(x)
 
@@ -587,8 +571,7 @@ if mode == "Best Bets (All)":
     board = pd.concat(combined, ignore_index=True)
     board["Edge"] = pd.to_numeric(board["Edge"], errors="coerce").fillna(-9999)
 
-    # FINAL contradiction prevention across ALL areas:
-    # keep only the single best Edge per ContrKey
+    # Global contradiction prevention across ALL areas
     board = board.sort_values("Edge", ascending=False).drop_duplicates(subset=["ContrKey"], keep="first")
 
     top = board.head(int(top_n)).copy()
@@ -647,7 +630,7 @@ elif mode == "Game Lines":
 elif mode == "Player Props":
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     sport = st.selectbox("Sport", list(SPORT_KEYS_PROPS.keys()), index=0)
-    prop_label = st.selectbox("Prop Type", list(PROP_MARKETS.keys()), index=1)
+    prop_label = st.selectbox("Prop Type", list(PROP_MARKETS.keys()), index=0)
     top_n = st.slider("Top picks (EDGE)", 2, 10, 5)
     show_top25 = st.toggle("Show top 25 snapshot", value=True)
     max_events_scan = st.slider("Events to scan (usage control)", 1, 10, 5)
@@ -686,8 +669,8 @@ elif mode == "Player Props":
     st.markdown("</div>", unsafe_allow_html=True)
 
 else:
-    # PGA only appears if DATAGOLF_API_KEY exists (hidden otherwise)
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("PGA")
-    st.success("DATAGOLF_API_KEY detected. PGA module can run here without affecting game lines/props.")
+    st.success("DATAGOLF key detected. PGA module can run here without impacting game lines/props.")
+    st.caption("You currently stored DATAGOLF_KEY; this app accepts DATAGOLF_KEY or DATAGOLF_API_KEY.")
     st.markdown("</div>", unsafe_allow_html=True)

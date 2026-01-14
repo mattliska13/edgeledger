@@ -36,6 +36,7 @@ hr { border: none; border-top: 1px solid rgba(148,163,184,0.18); margin: 10px 0;
 div[data-testid="stDataFrame"] { width: 100%; }
 div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
 
+/* Mobile improvements: bigger radio + spacing */
 @media (max-width: 768px) {
   .block-container { padding-left: 0.8rem; padding-right: 0.8rem; }
   .big-title { font-size: 1.35rem; }
@@ -43,6 +44,17 @@ div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
   .card { padding: 10px 10px; border-radius: 14px; }
   .stMarkdown p, .stCaption { font-size: 0.9rem; }
   canvas, svg, img { max-width: 100% !important; height: auto !important; }
+
+  /* radio buttons: bigger tap targets */
+  div[role="radiogroup"] label { 
+    padding: 10px 10px !important; 
+    margin: 6px 0 !important;
+    border-radius: 12px !important;
+  }
+  div[role="radiogroup"] label p { 
+    font-size: 1.05rem !important; 
+    font-weight: 700 !important;
+  }
 }
 </style>
 """
@@ -64,8 +76,6 @@ def get_key(name: str, default: str = "") -> str:
     return default
 
 ODDS_API_KEY = get_key("ODDS_API_KEY", "")
-
-# Support either DATAGOLF_API_KEY or DATAGOLF_KEY (your Secrets uses DATAGOLF_KEY)
 DATAGOLF_API_KEY = get_key("DATAGOLF_API_KEY", "")
 if not DATAGOLF_API_KEY:
     DATAGOLF_API_KEY = get_key("DATAGOLF_KEY", "")
@@ -142,7 +152,6 @@ GAME_MARKETS = {
     "Totals": "totals",
 }
 
-# The Odds API prop keys that you requested
 PROP_MARKETS = {
     "Anytime TD": "player_anytime_td",
     "Passing TDs": "player_pass_tds",
@@ -160,11 +169,10 @@ st.sidebar.markdown("<div class='subtle'>EDGE = YourProb − ImpliedProb(best pr
 st.sidebar.markdown("---")
 
 debug = st.sidebar.checkbox("Show debug logs", value=False)
-compact = st.sidebar.toggle("Mobile / Compact layout", value=False)
 show_non_value = st.sidebar.checkbox("Show non-value rows (Edge ≤ 0)", value=False)
 
-modes = ["Game Lines", "Player Props", "PGA"]
-mode = st.sidebar.radio("Mode", modes, index=0)
+# ✅ Radio buttons (mobile-friendly via CSS above)
+mode = st.sidebar.radio("Mode", ["Game Lines", "Player Props", "PGA"], index=0)
 
 with st.sidebar.expander("API Keys (session-only override)", expanded=False):
     st.caption("If Secrets aren’t set, paste keys here (session-only).")
@@ -186,8 +194,8 @@ st.sidebar.markdown(f"<span class='pill'>Updated: {now_str()}</span>", unsafe_al
 # =========================================================
 st.markdown("<div class='big-title'>EdgeLedger</div>", unsafe_allow_html=True)
 st.caption(
-    "Best bets are ranked by **Edge = YourProb − ImpliedProb(best price)**. "
-    "Contradictions are removed using half-point bucketing (so you won’t get Over + Under / both sides). "
+    "Ranked by **Edge = YourProb − ImpliedProb(best price)**. "
+    "**Strict contradiction removal**: only one side per game/market (and one side per player/market). "
     "DK/FD only. Game lines / props / PGA run independently."
 )
 
@@ -284,7 +292,7 @@ def normalize_props(event_payload):
             mkey = mk.get("key")
             for out in (mk.get("outcomes", []) or []):
                 player = out.get("name")
-                side = out.get("description")  # Over/Under usually; sometimes blank
+                side = out.get("description")  # Over/Under usually; may be blank
                 line = out.get("point")
                 price = out.get("price")
 
@@ -328,24 +336,19 @@ def compute_no_vig_within_book_two_way(df: pd.DataFrame, group_cols_book: list) 
 def estimate_your_prob(df: pd.DataFrame, key_cols: list, book_cols: list) -> pd.DataFrame:
     """
     YourProb:
-    - TWO-WAY markets: use no-vig within each book, then average across books
-    - ONE-WAY markets (e.g., Anytime TD often only "Yes"): use market-consensus avg implied across books
-      (this is what creates value via shopping: consensus vs best price implied)
+    - two-way: no-vig within each book, avg across books
+    - one-way: market-consensus avg implied across books (enables value by shopping)
     """
     if df.empty:
         return df.copy()
 
     out = add_implied(df)
-
-    # Determine if this key group is "two-way" or "one-way"
-    # We use count of distinct "Outcome/Side" within the group (per event/market/linebucket/player, etc.)
-    # If <=1 -> treat as one-way.
     side_col = "Outcome" if "Outcome" in out.columns else "Side"
-    grp = out.groupby(key_cols)[side_col].transform(lambda s: s.nunique(dropna=True))
-    out["_n_sides"] = pd.to_numeric(grp, errors="coerce").fillna(1)
+    n_sides = out.groupby(key_cols)[side_col].transform(lambda s: s.nunique(dropna=True))
+    out["_n_sides"] = pd.to_numeric(n_sides, errors="coerce").fillna(1)
 
-    # For two-way groups: compute no-vig within book and average
     out = compute_no_vig_within_book_two_way(out, group_cols_book=book_cols)
+
     nv_avg = out.groupby(key_cols)["NoVigProb"].transform("mean")
     imp_avg = out.groupby(key_cols)["Implied"].transform("mean")
 
@@ -355,12 +358,6 @@ def estimate_your_prob(df: pd.DataFrame, key_cols: list, book_cols: list) -> pd.
     return out
 
 def best_price_and_edge(df: pd.DataFrame, group_cols_best: list) -> pd.DataFrame:
-    """
-    For each unique bet group:
-    - pick BEST PRICE across books
-    - compute implied from that best price
-    - Edge = YourProb - ImpliedBest
-    """
     if df.empty:
         return df.copy()
 
@@ -376,22 +373,21 @@ def best_price_and_edge(df: pd.DataFrame, group_cols_best: list) -> pd.DataFrame
     best["ImpliedBest"] = clamp01(pd.to_numeric(best["ImpliedBest"], errors="coerce").fillna(0.5))
 
     best["Edge"] = (pd.to_numeric(best["YourProb"], errors="coerce") - pd.to_numeric(best["ImpliedBest"], errors="coerce"))
-    best["EV"] = (best["Edge"] * 100.0)  # edge in percentage points
+    best["EV"] = (best["Edge"] * 100.0)
     return best
 
-def prevent_contradictions(df_best: pd.DataFrame, contradiction_cols: list) -> pd.DataFrame:
+def strict_no_contradictions(df_best: pd.DataFrame, contradiction_cols: list) -> pd.DataFrame:
     """
-    Keep only ONE pick per contradiction group (max Edge).
-    This blocks Over+Under, both spread sides, etc. even if off by half point (LineBucket).
+    STRICT contradiction removal:
+    Keep exactly ONE row per contradiction group (max Edge), ignoring line differences.
+    This eliminates contradictions within DK, within FD, and across DK+FD simultaneously.
     """
     if df_best.empty:
         return df_best
-
     out = df_best.copy()
     out["Edge"] = pd.to_numeric(out["Edge"], errors="coerce").fillna(-1e9)
     idx = out.groupby(contradiction_cols, dropna=False)["Edge"].idxmax()
-    out = out.loc[idx].sort_values("Edge", ascending=False)
-    return out
+    return out.loc[idx].sort_values("Edge", ascending=False)
 
 def filter_value(df_best: pd.DataFrame, show_non_value: bool) -> pd.DataFrame:
     out = df_best.copy()
@@ -437,25 +433,25 @@ def build_game_lines_board(sport: str, bet_type: str):
     book_cols = ["Event", "Market", "Book"]
     best_cols = ["Event", "Market", "Outcome"]
 
+    # For spreads/totals, keep linebucket for probability math.
     if market_key in ["spreads", "totals"]:
         key_cols += ["LineBucket"]
         book_cols += ["LineBucket"]
         best_cols += ["LineBucket"]
-        contradiction_cols = ["Event", "Market", "LineBucket"]
-    else:
-        contradiction_cols = ["Event", "Market"]
 
     df = estimate_your_prob(df, key_cols=key_cols, book_cols=book_cols)
     df_best = best_price_and_edge(df, group_cols_best=best_cols)
-    df_best = prevent_contradictions(df_best, contradiction_cols=contradiction_cols)
+
+    # STRICT: only one pick per game per market
+    contradiction_cols = ["Event", "Market"]
+    df_best = strict_no_contradictions(df_best, contradiction_cols=contradiction_cols)
+
     df_best = filter_value(df_best, show_non_value=show_non_value)
     df_best = decorate_probs(df_best)
-
-    # Rank by EDGE (not YourProb%)
     df_best = df_best.sort_values("Edge", ascending=False)
     return df_best, {}
 
-def build_props_board(sport: str, prop_label: str, max_events_scan: int = 5):
+def build_props_board(sport: str, prop_label: str, max_events_scan: int = 8):
     sport_key = SPORT_KEYS_PROPS[sport]
     market_key = PROP_MARKETS[prop_label]
 
@@ -473,7 +469,6 @@ def build_props_board(sport: str, prop_label: str, max_events_scan: int = 5):
 
     all_rows = []
     call_log = []
-
     for eid in event_ids:
         r = fetch_event_odds(sport_key, eid, market_key)
         call_log.append({"event_id": eid, "market": market_key, "status": r["status"], "ok": r["ok"]})
@@ -482,7 +477,7 @@ def build_props_board(sport: str, prop_label: str, max_events_scan: int = 5):
         dfp = normalize_props(r["payload"])
         if not dfp.empty:
             all_rows.append(dfp)
-        time.sleep(0.05)
+        time.sleep(0.04)
 
     if debug:
         st.json({"prop_calls": call_log})
@@ -492,35 +487,29 @@ def build_props_board(sport: str, prop_label: str, max_events_scan: int = 5):
 
     df = pd.concat(all_rows, ignore_index=True)
 
-    # Keys
     key_cols = ["Event", "Market", "Player", "Side"]
     book_cols = ["Event", "Market", "Player", "Book"]
     best_cols = ["Event", "Market", "Player", "Side"]
 
-    has_line_bucket = "LineBucket" in df.columns and df["LineBucket"].notna().any()
-    if has_line_bucket:
+    if "LineBucket" in df.columns and df["LineBucket"].notna().any():
         key_cols += ["LineBucket"]
         book_cols += ["LineBucket"]
         best_cols += ["LineBucket"]
-        contradiction_cols = ["Event", "Market", "Player", "LineBucket"]
-    else:
-        # Anytime TD etc.
-        contradiction_cols = ["Event", "Market", "Player"]
 
-    # IMPORTANT:
-    # - Anytime TD is often one-way; our YourProb logic will switch to market-consensus avg implied automatically.
     df = estimate_your_prob(df, key_cols=key_cols, book_cols=book_cols)
     df_best = best_price_and_edge(df, group_cols_best=best_cols)
-    df_best = prevent_contradictions(df_best, contradiction_cols=contradiction_cols)
+
+    # STRICT: only one pick per player per event per market
+    contradiction_cols = ["Event", "Market", "Player"]
+    df_best = strict_no_contradictions(df_best, contradiction_cols=contradiction_cols)
+
     df_best = filter_value(df_best, show_non_value=show_non_value)
     df_best = decorate_probs(df_best)
-
-    # Rank by EDGE
     df_best = df_best.sort_values("Edge", ascending=False)
     return df_best, {}
 
 # =========================================================
-# Charts (percent axis)
+# Charts
 # =========================================================
 def bar_prob(df, label_col, prob_col_percent, title):
     if df.empty:
@@ -535,266 +524,311 @@ def bar_prob(df, label_col, prob_col_percent, title):
     st.pyplot(fig)
 
 # =========================================================
-# DataGolf (PGA) — robust parsing + OAD
+# PGA — Advanced DataGolf Module (independent)
 # =========================================================
 DG_HOST = "https://feeds.datagolf.com"
 
-def _find_first_list_of_dicts(payload, required_keys=None):
+def _dg_get(path: str, params: dict):
+    url = f"{DG_HOST}{path}"
+    ok, status, payload, final_url = safe_get(url, params=params, timeout=30)
+    return {"ok": ok, "status": status, "payload": payload, "url": final_url}
+
+def _dg_find_rows(payload):
     """
-    Recursively search a JSON-like structure for a list[dict] that contains required keys.
+    Robustly pull a list of dict rows from DataGolf responses.
+    Handles common shapes:
+      - {"data": [...]}
+      - {"predictions": [...]}
+      - {"preds": [...]}
+      - {"baseline": [...]}  (model keyed arrays)
+      - sometimes nested.
     """
-    if required_keys is None:
-        required_keys = []
+    if isinstance(payload, list) and (len(payload) == 0 or isinstance(payload[0], dict)):
+        return payload, {}
 
-    def ok_list(lst):
-        if not (isinstance(lst, list) and lst and isinstance(lst[0], dict)):
-            return False
-        if not required_keys:
-            return True
-        keys = set(lst[0].keys())
-        return all(k in keys for k in required_keys)
+    if not isinstance(payload, dict):
+        return [], {}
 
-    if ok_list(payload):
-        return payload
+    meta = {}
+    for k in ["event_name", "last_updated", "models_available", "tour"]:
+        if k in payload:
+            meta[k] = payload.get(k)
 
-    if isinstance(payload, dict):
-        for _, v in payload.items():
-            found = _find_first_list_of_dicts(v, required_keys=required_keys)
-            if found is not None:
-                return found
+    # Common top-level lists
+    for key in ["data", "predictions", "preds", "players", "rows"]:
+        if key in payload and isinstance(payload[key], list):
+            rows = payload[key]
+            if len(rows) == 0 or isinstance(rows[0], dict):
+                return rows, meta
 
-    if isinstance(payload, list):
-        for v in payload:
-            found = _find_first_list_of_dicts(v, required_keys=required_keys)
-            if found is not None:
-                return found
+    # Model arrays (baseline, baseline_history_fit, etc.)
+    # Choose best available model list.
+    model_keys = []
+    if "models_available" in payload and isinstance(payload["models_available"], list):
+        model_keys = [m for m in payload["models_available"] if isinstance(m, str)]
+    # prefer history_fit if exists
+    prefer = ["baseline_history_fit", "baseline", "sg_total", "default"]
+    model_choice = None
+    for p in prefer:
+        if p in payload and isinstance(payload[p], list):
+            model_choice = p
+            break
+        if p in model_keys and p in payload and isinstance(payload[p], list):
+            model_choice = p
+            break
 
+    if model_choice and isinstance(payload.get(model_choice), list):
+        rows = payload[model_choice]
+        if len(rows) == 0 or isinstance(rows[0], dict):
+            meta["model_used"] = model_choice
+            return rows, meta
+
+    # fallback: search for first list-of-dicts value
+    for k, v in payload.items():
+        if isinstance(v, list) and (len(v) == 0 or isinstance(v[0], dict)):
+            meta["model_used"] = k
+            return v, meta
+
+    return [], meta
+
+def _normalize_name(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    return " ".join(s.strip().split()).lower()
+
+def _first_col(df: pd.DataFrame, candidates: list):
+    for c in candidates:
+        if c in df.columns:
+            return c
     return None
 
-@st.cache_data(ttl=60 * 60 * 12)
-def datagolf_pre_tournament():
-    url = f"{DG_HOST}/preds/pre-tournament"
-    params = {
+def build_pga_board():
+    if not DATAGOLF_API_KEY.strip():
+        return pd.DataFrame(), {"error": 'Missing DATAGOLF_KEY. Add it in Streamlit Secrets as DATAGOLF_KEY="..." (or DATAGOLF_API_KEY). PGA is hidden until then.'}
+
+    # Pre-tournament: includes win + top10 prob when add_position=10
+    pre_params = {
         "tour": "pga",
-        "add_position": "10",
+        "add_position": 10,
         "dead_heat": "yes",
         "odds_format": "percent",
         "file_format": "json",
         "key": DATAGOLF_API_KEY,
     }
-    ok, status, payload, final_url = safe_get(url, params=params)
-    return {"ok": ok, "status": status, "payload": payload, "url": final_url}
+    decomp_params = {
+        "tour": "pga",
+        "file_format": "json",
+        "key": DATAGOLF_API_KEY,
+    }
+    skill_params = {
+        "display": "value",
+        "file_format": "json",
+        "key": DATAGOLF_API_KEY,
+    }
 
-@st.cache_data(ttl=60 * 60 * 24)
-def datagolf_decomp():
-    url = f"{DG_HOST}/preds/player-decompositions"
-    params = {"tour": "pga", "file_format": "json", "key": DATAGOLF_API_KEY}
-    ok, status, payload, final_url = safe_get(url, params=params)
-    return {"ok": ok, "status": status, "payload": payload, "url": final_url}
-
-@st.cache_data(ttl=60 * 60 * 24)
-def datagolf_skill():
-    url = f"{DG_HOST}/preds/skill-ratings"
-    params = {"display": "value", "file_format": "json", "key": DATAGOLF_API_KEY}
-    ok, status, payload, final_url = safe_get(url, params=params)
-    return {"ok": ok, "status": status, "payload": payload, "url": final_url}
-
-def build_pga_board():
-    if not DATAGOLF_API_KEY.strip():
-        return pd.DataFrame(), {"error": 'Missing DATAGOLF_KEY. Add it in Streamlit Secrets as DATAGOLF_KEY="..." (or DATAGOLF_API_KEY).'}
-
-    res_pre = datagolf_pre_tournament()
-    res_dec = datagolf_decomp()
-    res_skl = datagolf_skill()
+    pre = _dg_get("/preds/pre-tournament", pre_params)
+    dec = _dg_get("/preds/player-decompositions", decomp_params)
+    skl = _dg_get("/preds/skill-ratings", skill_params)
 
     if debug:
         st.json({
-            "dg_pre_tournament": {"ok": res_pre["ok"], "status": res_pre["status"], "url": res_pre["url"]},
-            "dg_decomp": {"ok": res_dec["ok"], "status": res_dec["status"], "url": res_dec["url"]},
-            "dg_skill": {"ok": res_skl["ok"], "status": res_skl["status"], "url": res_skl["url"]},
+            "dg_pre_tournament": {"ok": pre["ok"], "status": pre["status"], "url": pre["url"]},
+            "dg_decomp": {"ok": dec["ok"], "status": dec["status"], "url": dec["url"]},
+            "dg_skill": {"ok": skl["ok"], "status": skl["status"], "url": skl["url"]},
         })
 
-    if not res_pre["ok"]:
-        return pd.DataFrame(), {"error": "DataGolf pre-tournament failed", "payload": res_pre["payload"], "status": res_pre["status"]}
+    if not pre["ok"]:
+        return pd.DataFrame(), {"error": "DataGolf pre-tournament call failed", "status": pre["status"], "payload": pre["payload"]}
 
-    # Pre-tournament is percent odds_format, so win/top10 often appear as numeric percent.
-    # Find a list of dicts containing at least player name
-    rows = _find_first_list_of_dicts(res_pre["payload"], required_keys=["player_name"]) \
-        or _find_first_list_of_dicts(res_pre["payload"], required_keys=["player"]) \
-        or _find_first_list_of_dicts(res_pre["payload"], required_keys=[])
+    pre_rows, meta = _dg_find_rows(pre["payload"])
+    if not pre_rows:
+        # show meta to help diagnose without breaking app
+        return pd.DataFrame(), {"error": "No PGA prediction rows returned from DataGolf (parsed none).", "dg_meta": meta, "payload_keys": list(pre["payload"].keys()) if isinstance(pre["payload"], dict) else str(type(pre["payload"]))}
 
-    if rows is None or not rows:
-        # keep meta debug if present
-        meta = {}
-        if isinstance(res_pre["payload"], dict):
-            for k in ["event_name", "last_updated", "models_available"]:
-                if k in res_pre["payload"]:
-                    meta[k] = res_pre["payload"].get(k)
-        return pd.DataFrame(), {"error": "No PGA prediction rows returned from DataGolf (parsed none).", "dg_meta": meta}
+    df_pre = pd.DataFrame(pre_rows)
 
-    df = pd.DataFrame(rows).copy()
+    # Identify core columns
+    name_col = _first_col(df_pre, ["player_name", "name", "golfer", "player"])
+    if not name_col:
+        return pd.DataFrame(), {"error": "Could not find player name column in DataGolf pre-tournament payload."}
 
-    # Normalize name column
-    if "player_name" in df.columns:
-        df["Player"] = df["player_name"].astype(str)
-    elif "player" in df.columns:
-        df["Player"] = df["player"].astype(str)
-    else:
-        # last resort
-        df["Player"] = df.iloc[:, 0].astype(str)
+    # Find win/top10 prob columns (percent format)
+    win_col = _first_col(df_pre, ["win", "win_pct", "win_prob", "prob_win", "win_probability", "win%"])
+    top10_col = _first_col(df_pre, ["top_10", "top10", "top_10_pct", "top10_pct", "prob_top10", "top10_probability", "top_10_probability"])
 
-    # Extract win/top10 probability fields (varies by schema)
-    # We'll try common names; else fill NaN.
-    win_candidates = ["win", "prob_win", "win_pct", "win_percent", "win_probability"]
-    top10_candidates = ["top10", "prob_top10", "top_10", "top10_pct", "top10_percent", "top10_probability"]
+    # Some payloads may label positions differently; try generic patterns
+    if not win_col:
+        for c in df_pre.columns:
+            if "win" in c.lower():
+                win_col = c
+                break
+    if not top10_col:
+        for c in df_pre.columns:
+            cl = c.lower().replace(" ", "_")
+            if "top" in cl and "10" in cl:
+                top10_col = c
+                break
 
-    def first_col(cols):
-        for c in cols:
-            if c in df.columns:
-                return c
-        return None
+    if not win_col:
+        return pd.DataFrame(), {"error": "Could not locate win probability column in DataGolf pre-tournament data."}
 
-    win_col = first_col(win_candidates)
-    top10_col = first_col(top10_candidates)
+    # Convert percent -> 0..1
+    df_pre["Player"] = df_pre[name_col].astype(str)
+    df_pre["PlayerKey"] = df_pre["Player"].apply(_normalize_name)
 
-    # Many DG feeds label columns like "baseline_win", "baseline_history_fit_win"
-    # So also scan for any column containing "win" and any containing "top10"
-    if win_col is None:
-        win_like = [c for c in df.columns if "win" in c.lower()]
-        win_col = win_like[0] if win_like else None
-    if top10_col is None:
-        t10_like = [c for c in df.columns if "top10" in c.lower() or "top_10" in c.lower()]
-        top10_col = t10_like[0] if t10_like else None
+    df_pre["WinProb"] = pd.to_numeric(df_pre[win_col], errors="coerce") / 100.0
+    df_pre["Top10Prob"] = pd.to_numeric(df_pre[top10_col], errors="coerce") / 100.0 if top10_col else np.nan
 
-    df["WinProb"] = pd.to_numeric(df[win_col], errors="coerce") if win_col else np.nan
-    df["Top10Prob"] = pd.to_numeric(df[top10_col], errors="coerce") if top10_col else np.nan
+    # Skill ratings (current form proxy)
+    df_skill = pd.DataFrame()
+    if skl["ok"]:
+        rows_s, _ = _dg_find_rows(skl["payload"])
+        if rows_s:
+            df_skill = pd.DataFrame(rows_s)
+            nm = _first_col(df_skill, ["player_name", "name", "player"])
+            if nm:
+                df_skill["PlayerKey"] = df_skill[nm].astype(str).apply(_normalize_name)
 
-    # DataGolf returned percent; convert to 0-1
-    # If values look like 0-100 -> divide by 100
-    for col in ["WinProb", "Top10Prob"]:
-        mx = pd.to_numeric(df[col], errors="coerce").max()
-        if pd.notna(mx) and mx > 1.5:
-            df[col] = pd.to_numeric(df[col], errors="coerce") / 100.0
+    # Decompositions (course fit / SG splits / bogey avoid if present)
+    df_dec = pd.DataFrame()
+    if dec["ok"]:
+        rows_d, _ = _dg_find_rows(dec["payload"])
+        if rows_d:
+            df_dec = pd.DataFrame(rows_d)
+            nm = _first_col(df_dec, ["player_name", "name", "player"])
+            if nm:
+                df_dec["PlayerKey"] = df_dec[nm].astype(str).apply(_normalize_name)
 
-    df["WinProb"] = clamp01(df["WinProb"].fillna(0.001))
-    df["Top10Prob"] = clamp01(df["Top10Prob"].fillna(0.001))
+    # Merge extras
+    df = df_pre[["Player", "PlayerKey", "WinProb", "Top10Prob"]].copy()
 
-    # Pull decomposition / skill if available, but keep robust (optional)
-    # We score course fit / history / form / T2G / putting / bogey avoidance if found.
-    comp = pd.DataFrame()
-    if res_dec["ok"]:
-        dec_rows = _find_first_list_of_dicts(res_dec["payload"], required_keys=["player_name"]) \
-            or _find_first_list_of_dicts(res_dec["payload"], required_keys=["player"])
-        if dec_rows:
-            comp = pd.DataFrame(dec_rows)
+    # Attach some common useful columns if present
+    if not df_skill.empty:
+        # pick a "rating" column
+        rating_col = _first_col(df_skill, ["skill", "rating", "sg_total", "sg_total_value", "value"])
+        if not rating_col:
+            # first numeric col heuristic
+            num_cols = [c for c in df_skill.columns if pd.api.types.is_numeric_dtype(pd.to_numeric(df_skill[c], errors="coerce"))]
+            rating_col = num_cols[0] if num_cols else None
+        if rating_col:
+            tmp = df_skill[["PlayerKey", rating_col]].copy()
+            tmp = tmp.rename(columns={rating_col: "SkillRating"})
+            df = df.merge(tmp, on="PlayerKey", how="left")
 
-    skl = pd.DataFrame()
-    if res_skl["ok"]:
-        skl_rows = _find_first_list_of_dicts(res_skl["payload"], required_keys=["player_name"]) \
-            or _find_first_list_of_dicts(res_skl["payload"], required_keys=["player"])
-        if skl_rows:
-            skl = pd.DataFrame(skl_rows)
+    if not df_dec.empty:
+        # Try to extract SG T2G, Putting, Bogey Avoidance, Course Fit style columns when present
+        col_map_candidates = {
+            "SG_T2G": ["sg_t2g", "sg_tee_to_green", "t2g", "tee_to_green"],
+            "SG_Putt": ["sg_putt", "sg_putting", "putt", "putting"],
+            "BogeyAvoid": ["bogey_avoid", "bogey_avoidance", "bogeyavoid", "bogeys_avoided"],
+            "CourseFit": ["course_fit", "fit", "coursefit", "like_course", "like_courses", "comp_courses"],
+            "CourseHistory": ["course_history", "history", "course_hist", "coursehistory"],
+            "RecentForm": ["recent_form", "form", "current_form", "recent"],
+        }
+        tmp = df_dec.copy()
+        keep_cols = ["PlayerKey"]
+        ren = {}
+        for out_name, cands in col_map_candidates.items():
+            c = _first_col(tmp, cands)
+            if not c:
+                for cc in tmp.columns:
+                    if out_name.lower().replace("_", "") in cc.lower().replace("_", ""):
+                        c = cc
+                        break
+            if c:
+                keep_cols.append(c)
+                ren[c] = out_name
+        if len(keep_cols) > 1:
+            tmp = tmp[keep_cols].rename(columns=ren)
+            df = df.merge(tmp, on="PlayerKey", how="left")
 
-    # Normalize name column for joins
-    def norm_name(x):
-        return str(x).strip().lower()
+    # Normalize missing numeric
+    for c in ["SkillRating", "SG_T2G", "SG_Putt", "BogeyAvoid", "CourseFit", "CourseHistory", "RecentForm"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df["name_key"] = df["Player"].map(norm_name)
+    # Build model scores:
+    # - Winners: win prob + skill + t2g + putting + bogey avoid + (history/fit/form if present)
+    # - Top10: top10 prob + similar components
+    def z(x):
+        x = pd.to_numeric(x, errors="coerce")
+        if x.isna().all():
+            return pd.Series(np.zeros(len(x)), index=x.index)
+        mu = np.nanmean(x)
+        sd = np.nanstd(x)
+        if sd == 0 or np.isnan(sd):
+            return pd.Series(np.zeros(len(x)), index=x.index)
+        return (x - mu) / sd
 
-    if not comp.empty:
-        if "player_name" in comp.columns:
-            comp["name_key"] = comp["player_name"].map(norm_name)
-        elif "player" in comp.columns:
-            comp["name_key"] = comp["player"].map(norm_name)
+    df["z_win"] = z(df["WinProb"])
+    df["z_top10"] = z(df["Top10Prob"]) if df["Top10Prob"].notna().any() else 0.0
 
-        # Attempt to locate useful columns
-        # (field names can vary, so we scan by keywords)
-        def find_kw(cols, kws):
-            for c in cols:
-                lc = c.lower()
-                if all(k in lc for k in kws):
-                    return c
-            return None
+    # Optional z's
+    df["z_skill"] = z(df["SkillRating"]) if "SkillRating" in df.columns else 0.0
+    df["z_t2g"] = z(df["SG_T2G"]) if "SG_T2G" in df.columns else 0.0
+    df["z_putt"] = z(df["SG_Putt"]) if "SG_Putt" in df.columns else 0.0
+    df["z_bogey"] = z(df["BogeyAvoid"]) if "BogeyAvoid" in df.columns else 0.0
+    df["z_fit"] = z(df["CourseFit"]) if "CourseFit" in df.columns else 0.0
+    df["z_hist"] = z(df["CourseHistory"]) if "CourseHistory" in df.columns else 0.0
+    df["z_form"] = z(df["RecentForm"]) if "RecentForm" in df.columns else 0.0
 
-        cols = list(comp.columns)
-        # recent form
-        c_form = find_kw(cols, ["recent"]) or find_kw(cols, ["form"])
-        # course history / fit
-        c_hist = find_kw(cols, ["history"]) or find_kw(cols, ["course"])
-        c_fit = find_kw(cols, ["fit"]) or find_kw(cols, ["course", "fit"])
-        # strokes gained components
-        c_t2g = find_kw(cols, ["tee", "green"]) or find_kw(cols, ["t2g"])
-        c_putt = find_kw(cols, ["putt"]) or find_kw(cols, ["putting"])
-        c_bogey = find_kw(cols, ["bogey"])
-
-        keep = {"name_key": "name_key"}
-        if c_form: keep[c_form] = "RecentForm"
-        if c_hist: keep[c_hist] = "CourseHistory"
-        if c_fit: keep[c_fit] = "CourseFit"
-        if c_t2g: keep[c_t2g] = "SG_T2G"
-        if c_putt: keep[c_putt] = "SG_Putt"
-        if c_bogey: keep[c_bogey] = "BogeyAvoid"
-
-        comp2 = comp[list(keep.keys())].rename(columns=keep).copy()
-        df = df.merge(comp2, on="name_key", how="left")
-
-    # Build a simple composite OAD score (robustly handles missing columns)
-    for c in ["RecentForm", "CourseHistory", "CourseFit", "SG_T2G", "SG_Putt", "BogeyAvoid"]:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    # Normalize optional feature columns to 0-1 within field (if present)
-    def norm01(s):
-        s = pd.to_numeric(s, errors="coerce")
-        if s.notna().sum() < 5:
-            return pd.Series([np.nan] * len(s))
-        mn, mx = s.min(), s.max()
-        if pd.isna(mn) or pd.isna(mx) or mx - mn == 0:
-            return pd.Series([np.nan] * len(s))
-        return (s - mn) / (mx - mn)
-
-    feat_cols = ["RecentForm", "CourseHistory", "CourseFit", "SG_T2G", "SG_Putt", "BogeyAvoid"]
-    for c in feat_cols:
-        df[c + "_N"] = norm01(df[c])
-
-    # Composite score (weights are reasonable defaults; you can tune later)
-    # Uses WinProb/Top10Prob as anchor, then fit/form as tiebreakers.
-    df["OADScore"] = (
-        0.50 * df["Top10Prob"] +
-        0.35 * df["WinProb"] +
-        0.15 * df[["RecentForm_N", "CourseFit_N", "CourseHistory_N", "SG_T2G_N", "SG_Putt_N", "BogeyAvoid_N"]].mean(axis=1, skipna=True)
+    # Scores (weights tuned for your requested logic)
+    df["WinScore"] = (
+        0.55 * df["z_win"] +
+        0.12 * df["z_t2g"] +
+        0.08 * df["z_putt"] +
+        0.08 * df["z_skill"] +
+        0.06 * df["z_fit"] +
+        0.06 * df["z_hist"] +
+        0.05 * df["z_bogey"]
     )
 
-    # Output board
-    out = df[[
-        "Player", "WinProb", "Top10Prob", "OADScore",
-        "RecentForm", "CourseFit", "CourseHistory", "SG_T2G", "SG_Putt", "BogeyAvoid"
-    ]].copy()
+    df["Top10Score"] = (
+        0.55 * df["z_top10"] +
+        0.12 * df["z_t2g"] +
+        0.08 * df["z_putt"] +
+        0.07 * df["z_skill"] +
+        0.06 * df["z_fit"] +
+        0.06 * df["z_hist"] +
+        0.06 * df["z_bogey"]
+    )
 
-    out["Win%"] = pct01_to_100(out["WinProb"])
-    out["Top10%"] = pct01_to_100(out["Top10Prob"])
-    out = out.sort_values("OADScore", ascending=False)
+    # One-and-Done score: prioritize top10 stability + win upside + tee-to-green
+    df["OADScore"] = (
+        0.55 * df["Top10Score"] +
+        0.25 * df["WinScore"] +
+        0.20 * df["z_t2g"]
+    )
 
-    return out, {}
+    # Clean display
+    df["Win%"] = pct01_to_100(df["WinProb"])
+    df["Top10%"] = pct01_to_100(df["Top10Prob"]) if df["Top10Prob"].notna().any() else np.nan
+
+    # Select top lists
+    winners = df.sort_values("WinScore", ascending=False).head(10).copy()
+    top10s = df.sort_values("Top10Score", ascending=False).head(10).copy()
+    oad = df.sort_values("OADScore", ascending=False).head(7).copy()
+
+    return {"winners": winners, "top10s": top10s, "oad": oad, "meta": meta}, {}
 
 # =========================================================
-# MAIN UI
+# MAIN
 # =========================================================
 if mode == "Game Lines":
     st.markdown("<div class='card'>", unsafe_allow_html=True)
 
-    sport = st.selectbox("Sport", list(SPORT_KEYS_LINES.keys()), index=0)
-    bet_type = st.selectbox("Bet Type", list(GAME_MARKETS.keys()), index=1)
-    top_n = st.slider("Top picks (ranked by EDGE)", 2, 10, 5)
-    show_top25 = st.toggle("Show top 25 snapshot", value=True)
+    sport = st.selectbox("Sport", list(SPORT_KEYS_LINES.keys()), index=0, key="gl_sport")
+    bet_type = st.selectbox("Bet Type", list(GAME_MARKETS.keys()), index=1, key="gl_bettype")
+    top_n = st.slider("Top picks (ranked by EDGE)", 2, 10, 5, key="gl_topn")
+    show_top25 = st.toggle("Show top 25 snapshot", value=True, key="gl_top25")
 
     df_best, err = build_game_lines_board(sport, bet_type)
     if df_best.empty:
-        st.warning(err.get("error", "No game lines rows available."))
+        st.warning(err.get("error", "No game lines available."))
         st.stop()
 
-    st.subheader(f"{sport} — {bet_type} (DK/FD)")
-    st.caption("Ranked by Edge. Contradictions removed (half-point bucketed).")
+    st.subheader(f"{sport} — {bet_type} (DK/FD) — STRICT no-contradictions")
+    st.caption("Strict rule: only ONE pick per game per market (even across different lines). Ranked by Edge.")
 
     top = df_best.head(int(top_n)).copy()
     top["⭐ BestBook"] = "⭐ " + top["BestBook"].astype(str)
@@ -824,22 +858,19 @@ if mode == "Game Lines":
 elif mode == "Player Props":
     st.markdown("<div class='card'>", unsafe_allow_html=True)
 
-    sport = st.selectbox("Sport", list(SPORT_KEYS_PROPS.keys()), index=0)
-    prop_label = st.selectbox("Prop Type", list(PROP_MARKETS.keys()), index=0)  # default Anytime TD
-    top_n = st.slider("Top picks (ranked by EDGE)", 2, 10, 5)
-    show_top25 = st.toggle("Show top 25 snapshot", value=True)
-    max_events_scan = st.slider("Events to scan (usage control)", 1, 12, 6)
+    sport = st.selectbox("Sport", list(SPORT_KEYS_PROPS.keys()), index=0, key="pp_sport")
+    prop_label = st.selectbox("Prop Type", list(PROP_MARKETS.keys()), index=0, key="pp_prop")
+    top_n = st.slider("Top picks (ranked by EDGE)", 2, 10, 5, key="pp_topn")
+    show_top25 = st.toggle("Show top 25 snapshot", value=True, key="pp_top25")
+    max_events_scan = st.slider("Events to scan (usage control)", 1, 14, 8, key="pp_scan")
 
     df_best, err = build_props_board(sport, prop_label, max_events_scan=max_events_scan)
     if df_best.empty:
         st.warning(err.get("error", "No props returned for DK/FD on scanned events."))
         st.stop()
 
-    st.subheader(f"{sport} — Player Props ({prop_label}) — DK/FD")
-    st.caption(
-        "Ranked by Edge. Contradictions removed. "
-        "For one-way markets (like Anytime TD), YourProb uses consensus avg implied across books vs best price implied."
-    )
+    st.subheader(f"{sport} — Player Props ({prop_label}) — STRICT no-contradictions")
+    st.caption("Strict rule: only ONE pick per player per market per game (no Over+Under, no different lines). Ranked by Edge.")
 
     top = df_best.head(int(top_n)).copy()
     top["⭐ BestBook"] = "⭐ " + top["BestBook"].astype(str)
@@ -874,39 +905,32 @@ else:
         st.stop()
 
     st.subheader("PGA — Course Fit + Course History + Current Form (DataGolf)")
-    st.caption("Outputs: Top Winners, Top-10s, and One-and-Done options (ranked by a composite score).")
+    st.caption("Top picks for Win / Top-10 + One-and-Done using DataGolf model probabilities + SG splits + fit/history/form proxies.")
 
-    df_pga, err = build_pga_board()
-    if df_pga.empty:
-        st.warning(err.get("error", "No PGA prediction rows returned from DataGolf."))
+    out, err = build_pga_board()
+    if isinstance(out, dict) and "winners" in out:
+        if debug:
+            st.json({"dg_meta": out.get("meta", {})})
+
+        winners = out["winners"]
+        top10s = out["top10s"]
+        oad = out["oad"]
+
+        st.markdown("### 🏆 Best Win Picks (Top 10)")
+        show_cols = [c for c in ["Player", "Win%", "Top10%", "SG_T2G", "SG_Putt", "BogeyAvoid", "CourseFit", "CourseHistory", "RecentForm", "SkillRating", "WinScore"] if c in winners.columns]
+        st.dataframe(winners[show_cols], use_container_width=True, hide_index=True)
+
+        st.markdown("### 🎯 Best Top-10 Picks (Top 10)")
+        show_cols2 = [c for c in ["Player", "Top10%", "Win%", "SG_T2G", "SG_Putt", "BogeyAvoid", "CourseFit", "CourseHistory", "RecentForm", "SkillRating", "Top10Score"] if c in top10s.columns]
+        st.dataframe(top10s[show_cols2], use_container_width=True, hide_index=True)
+
+        st.markdown("### 🧳 Best One-and-Done Options (Top 7)")
+        show_cols3 = [c for c in ["Player", "Top10%", "Win%", "SG_T2G", "SG_Putt", "BogeyAvoid", "CourseFit", "CourseHistory", "RecentForm", "SkillRating", "OADScore"] if c in oad.columns]
+        st.dataframe(oad[show_cols3], use_container_width=True, hide_index=True)
+
+    else:
+        st.warning(err.get("error", "No PGA data available right now."))
         if debug:
             st.json(err)
-        st.stop()
-
-    # Winners
-    st.markdown("### Top 10 — Winners (model-based)")
-    win_board = df_pga.sort_values("WinProb", ascending=False).head(10).copy()
-    st.dataframe(
-        win_board[["Player", "Win%", "Top10%", "OADScore"]],
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # Top-10 bets
-    st.markdown("### Top 10 — Top-10 Finish (model-based)")
-    t10_board = df_pga.sort_values("Top10Prob", ascending=False).head(10).copy()
-    st.dataframe(
-        t10_board[["Player", "Top10%", "Win%", "OADScore"]],
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # One & Done
-    st.markdown("### One-and-Done — Best Options (composite)")
-    st.caption("Score blends Top10%, Win%, and (when available) fit/history/form + SG components + bogey avoidance.")
-    oad_board = df_pga.sort_values("OADScore", ascending=False).head(10).copy()
-    cols = ["Player", "OADScore", "Top10%", "Win%", "RecentForm", "CourseFit", "CourseHistory", "SG_T2G", "SG_Putt", "BogeyAvoid"]
-    cols = [c for c in cols if c in oad_board.columns]
-    st.dataframe(oad_board[cols], use_container_width=True, hide_index=True)
 
     st.markdown("</div>", unsafe_allow_html=True)

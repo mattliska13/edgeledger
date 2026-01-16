@@ -61,7 +61,7 @@ div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
 st.markdown(CSS, unsafe_allow_html=True)
 
 # =========================================================
-# Tracker (ADDED - does not change odds/PGA logic)
+# Tracker (does not change odds/PGA logic)
 # =========================================================
 TRACK_FILE = "tracker.csv"
 
@@ -136,7 +136,6 @@ def _summary_pick_rate(df: pd.DataFrame, label: str) -> pd.DataFrame:
         Pushes=("Pushes","sum"),
     ).reset_index()
 
-    # Hit rate on graded picks where result is W/L/P
     denom = (agg["Wins"] + agg["Losses"] + agg["Pushes"]).replace(0, np.nan)
     agg["HitRate%"] = ((agg["Wins"] / denom) * 100.0).round(1).fillna(0.0)
 
@@ -197,6 +196,246 @@ def is_list_of_dicts(x):
 
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# =========================================================
+# ESPN Auto-Grading (Tracker only - does not change bet logic)
+# =========================================================
+ESPN_HOST = "https://site.api.espn.com/apis/site/v2/sports"
+
+ESPN_SPORT_PATHS = {
+    "NFL": "football/nfl",
+    "CFB": "football/college-football",
+    "CBB": "basketball/mens-college-basketball",
+}
+
+def _norm_team(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.strip().lower()
+    for ch in [".", ",", "'", "\""]:
+        s = s.replace(ch, "")
+    s = " ".join(s.split())
+    s = s.replace("st ", "saint ")
+    s = s.replace("st.", "saint ")
+    return s
+
+def _parse_matchup(event_str: str):
+    if not isinstance(event_str, str) or "@" not in event_str:
+        return None, None
+    away, home = event_str.split("@", 1)
+    return away.strip(), home.strip()
+
+def _is_final(espn_event: dict) -> bool:
+    try:
+        comp = (espn_event.get("competitions") or [])[0]
+        status = (comp.get("status") or {}).get("type") or {}
+        if status.get("completed") is True:
+            return True
+        if str(status.get("state", "")).lower() in ["post", "postponed", "canceled", "final"]:
+            return True
+        desc = str(status.get("description", "")).lower()
+        if "final" in desc:
+            return True
+    except Exception:
+        pass
+    return False
+
+def _extract_scores(espn_event: dict):
+    try:
+        comp = (espn_event.get("competitions") or [])[0]
+        comps = comp.get("competitors") or []
+        home = next((c for c in comps if c.get("homeAway") == "home"), None)
+        away = next((c for c in comps if c.get("homeAway") == "away"), None)
+        if not home or not away:
+            return None
+
+        def team_name(c):
+            t = c.get("team") or {}
+            return (t.get("displayName") or t.get("name") or t.get("shortDisplayName") or "").strip()
+
+        def team_score(c):
+            sc = c.get("score")
+            try:
+                return float(sc)
+            except Exception:
+                return None
+
+        hn = team_name(home)
+        an = team_name(away)
+        hs = team_score(home)
+        a_s = team_score(away)
+        if not hn or not an or hs is None or a_s is None:
+            return None
+
+        return {"away_name": an, "home_name": hn, "away_score": a_s, "home_score": hs}
+    except Exception:
+        return None
+
+@st.cache_data(ttl=60 * 10)
+def fetch_espn_scoreboard(sport_label: str, date_yyyymmdd: str):
+    sp = ESPN_SPORT_PATHS.get(sport_label)
+    if not sp:
+        return {"ok": False, "status": 0, "payload": {"error": f"ESPN sport mapping missing for {sport_label}"}}
+
+    url = f"{ESPN_HOST}/{sp}/scoreboard"
+    params = {"dates": date_yyyymmdd}
+    ok, status, payload, final_url = safe_get(url, params=params, timeout=25)
+    return {"ok": ok, "status": status, "payload": payload, "url": final_url, "params": params}
+
+def build_espn_match_index(payload: dict):
+    idx = {}
+    if not isinstance(payload, dict):
+        return idx
+    events = payload.get("events")
+    if not isinstance(events, list):
+        return idx
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        sc = _extract_scores(ev)
+        if not sc:
+            continue
+        final = _is_final(ev)
+        k = (_norm_team(sc["away_name"]), _norm_team(sc["home_name"]))
+        idx[k] = {
+            "final": final,
+            "away_score": sc["away_score"],
+            "home_score": sc["home_score"],
+            "away_name": sc["away_name"],
+            "home_name": sc["home_name"],
+        }
+    return idx
+
+def _grade_game_line_row(row: pd.Series, espn_idx: dict):
+    try:
+        if str(row.get("Mode", "")) != "Game Lines":
+            return None, None
+
+        sport = str(row.get("Sport", "")).strip()
+        market = str(row.get("Market", "")).strip()  # Moneyline / Spreads / Totals
+        event = str(row.get("Event", "")).strip()
+        selection = str(row.get("Selection", "")).strip()
+        line_raw = row.get("Line", "")
+
+        away, home = _parse_matchup(event)
+        if not away or not home:
+            return None, None
+
+        key = (_norm_team(away), _norm_team(home))
+        g = espn_idx.get(key)
+        if not g or not g.get("final"):
+            return None, None
+
+        a = float(g["away_score"])
+        h = float(g["home_score"])
+        total = a + h
+
+        if market == "Moneyline":
+            sel = _norm_team(selection)
+            if sel == _norm_team(g["away_name"]):
+                return "Graded", ("W" if a > h else ("P" if a == h else "L"))
+            if sel == _norm_team(g["home_name"]):
+                return "Graded", ("W" if h > a else ("P" if a == h else "L"))
+            return None, None
+
+        if market == "Spreads":
+            try:
+                spread = float(line_raw)
+            except Exception:
+                return None, None
+
+            sel = _norm_team(selection)
+            if sel == _norm_team(g["away_name"]):
+                adj = a + spread
+                if adj > h: return "Graded", "W"
+                if adj < h: return "Graded", "L"
+                return "Graded", "P"
+            if sel == _norm_team(g["home_name"]):
+                adj = h + spread
+                if adj > a: return "Graded", "W"
+                if adj < a: return "Graded", "L"
+                return "Graded", "P"
+            return None, None
+
+        if market == "Totals":
+            try:
+                tline = float(line_raw)
+            except Exception:
+                return None, None
+            sel = selection.strip().lower()
+            if sel == "over":
+                if total > tline: return "Graded", "W"
+                if total < tline: return "Graded", "L"
+                return "Graded", "P"
+            if sel == "under":
+                if total < tline: return "Graded", "W"
+                if total > tline: return "Graded", "L"
+                return "Graded", "P"
+            return None, None
+
+        return None, None
+    except Exception:
+        return None, None
+
+def auto_grade_tracker_from_espn(df: pd.DataFrame, debug_log: bool = False):
+    if df.empty:
+        return df, {"graded": 0, "checked": 0, "notes": ["Tracker empty."]}
+
+    d = df.copy()
+    d["Status"] = d["Status"].fillna("Pending")
+    d["Result"] = d["Result"].fillna("")
+
+    mask = (
+        (d["Mode"] == "Game Lines") &
+        (d["Status"].astype(str) != "Graded") &
+        (d["Sport"].isin(list(ESPN_SPORT_PATHS.keys())))
+    )
+    candidates = d[mask].copy()
+    if candidates.empty:
+        return d, {"graded": 0, "checked": 0, "notes": ["No eligible ungraded Game Lines rows found."]}
+
+    candidates["LoggedAt_dt"] = pd.to_datetime(candidates["LoggedAt"], errors="coerce")
+    candidates = candidates.dropna(subset=["LoggedAt_dt"])
+    if candidates.empty:
+        return d, {"graded": 0, "checked": 0, "notes": ["No parseable LoggedAt timestamps for eligible rows."]}
+
+    graded_count = 0
+    checked_count = 0
+    notes = []
+    cache_idx = {}
+
+    def get_idx_for(sport, date_dt):
+        for offset in [0, -1, 1]:
+            dd = (date_dt + pd.Timedelta(days=offset)).strftime("%Y%m%d")
+            k = (sport, dd)
+            if k not in cache_idx:
+                res = fetch_espn_scoreboard(sport, dd)
+                if res.get("ok"):
+                    cache_idx[k] = build_espn_match_index(res["payload"])
+                else:
+                    cache_idx[k] = {}
+            if cache_idx[k]:
+                return cache_idx[k]
+        return {}
+
+    for idx_row, row in candidates.iterrows():
+        sport = str(row.get("Sport", "")).strip()
+        date_dt = row["LoggedAt_dt"].normalize()
+
+        espn_idx = get_idx_for(sport, date_dt)
+        checked_count += 1
+
+        new_status, new_result = _grade_game_line_row(row, espn_idx)
+        if new_status and new_result:
+            d.at[idx_row, "Status"] = new_status
+            d.at[idx_row, "Result"] = new_result
+            graded_count += 1
+
+    if debug_log:
+        notes.append(f"Checked {checked_count} eligible rows; graded {graded_count} rows (Final games only).")
+
+    return d, {"graded": graded_count, "checked": checked_count, "notes": notes}
 
 # =========================================================
 # Odds math
@@ -265,7 +504,6 @@ st.sidebar.markdown("---")
 debug = st.sidebar.checkbox("Show debug logs", value=False)
 show_non_value = st.sidebar.checkbox("Show non-value rows (Edge ≤ 0)", value=False)
 
-# ✅ Radio buttons (mobile-friendly via CSS above)
 mode = st.sidebar.radio("Mode", ["Game Lines", "Player Props", "PGA", "Tracker"], index=0)
 
 with st.sidebar.expander("API Keys (session-only override)", expanded=False):
@@ -386,7 +624,7 @@ def normalize_props(event_payload):
             mkey = mk.get("key")
             for out in (mk.get("outcomes", []) or []):
                 player = out.get("name")
-                side = out.get("description")  # Over/Under usually; may be blank
+                side = out.get("description")
                 line = out.get("point")
                 price = out.get("price")
 
@@ -428,11 +666,6 @@ def compute_no_vig_within_book_two_way(df: pd.DataFrame, group_cols_book: list) 
     return out
 
 def estimate_your_prob(df: pd.DataFrame, key_cols: list, book_cols: list) -> pd.DataFrame:
-    """
-    YourProb:
-    - two-way: no-vig within each book, avg across books
-    - one-way: market-consensus avg implied across books (enables value by shopping)
-    """
     if df.empty:
         return df.copy()
 
@@ -471,11 +704,6 @@ def best_price_and_edge(df: pd.DataFrame, group_cols_best: list) -> pd.DataFrame
     return best
 
 def strict_no_contradictions(df_best: pd.DataFrame, contradiction_cols: list) -> pd.DataFrame:
-    """
-    STRICT contradiction removal:
-    Keep exactly ONE row per contradiction group (max Edge), ignoring line differences.
-    This eliminates contradictions within DK, within FD, and across DK+FD simultaneously.
-    """
     if df_best.empty:
         return df_best
     out = df_best.copy()
@@ -527,7 +755,6 @@ def build_game_lines_board(sport: str, bet_type: str):
     book_cols = ["Event", "Market", "Book"]
     best_cols = ["Event", "Market", "Outcome"]
 
-    # For spreads/totals, keep linebucket for probability math.
     if market_key in ["spreads", "totals"]:
         key_cols += ["LineBucket"]
         book_cols += ["LineBucket"]
@@ -536,7 +763,6 @@ def build_game_lines_board(sport: str, bet_type: str):
     df = estimate_your_prob(df, key_cols=key_cols, book_cols=book_cols)
     df_best = best_price_and_edge(df, group_cols_best=best_cols)
 
-    # STRICT: only one pick per game per market
     contradiction_cols = ["Event", "Market"]
     df_best = strict_no_contradictions(df_best, contradiction_cols=contradiction_cols)
 
@@ -593,7 +819,6 @@ def build_props_board(sport: str, prop_label: str, max_events_scan: int = 8):
     df = estimate_your_prob(df, key_cols=key_cols, book_cols=book_cols)
     df_best = best_price_and_edge(df, group_cols_best=best_cols)
 
-    # STRICT: only one pick per player per market per game
     contradiction_cols = ["Event", "Market", "Player"]
     df_best = strict_no_contradictions(df_best, contradiction_cols=contradiction_cols)
 
@@ -853,7 +1078,7 @@ def build_pga_board():
     return {"winners": winners, "top10s": top10s, "oad": oad, "meta": meta}, {}
 
 # =========================================================
-# Tracker Page UI (ADDED)
+# Tracker Page UI (UPDATED with ESPN auto-grade)
 # =========================================================
 def render_tracker():
     st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -862,7 +1087,26 @@ def render_tracker():
 
     df = _load_tracker()
 
-    # Quick summaries
+    st.markdown("### Auto-grade (ESPN) — Game Lines only")
+    st.caption("Auto-grades Moneyline / Spreads / Totals for NFL/CFB/CBB when ESPN marks the game Final. Props + PGA remain manual.")
+
+    colA, colB, colC = st.columns([1, 1, 2])
+    with colA:
+        auto_run = st.toggle("Auto-run on open", value=False, key="trk_autorun")
+    with colB:
+        if st.button("Auto-grade now (ESPN)", key="trk_autograde_btn"):
+            updated, meta = auto_grade_tracker_from_espn(df, debug_log=debug)
+            _save_tracker(updated)
+            df = updated
+            st.success(f"Auto-graded {meta.get('graded', 0)} / checked {meta.get('checked', 0)} eligible rows ✅")
+
+    if auto_run:
+        updated, meta = auto_grade_tracker_from_espn(df, debug_log=False)
+        if meta.get("graded", 0) > 0:
+            _save_tracker(updated)
+            df = updated
+            st.info(f"Auto-graded {meta.get('graded', 0)} rows from ESPN (Final games).")
+
     win_map = _windows(df)
     tables = []
     for label, sub in win_map.items():
@@ -881,10 +1125,9 @@ def render_tracker():
     else:
         st.info("No tracked picks yet. Log picks from Game Lines / Props / PGA.")
 
-    st.markdown("### Grade Picks")
+    st.markdown("### Grade Picks (manual override)")
     st.caption("Set Status=Graded and Result=W/L/P/N/A. (Leaving Pending means not counted in hit rate.)")
 
-    # Ensure editable defaults
     if df.empty:
         st.info("Tracker is empty.")
     else:
@@ -928,7 +1171,6 @@ if mode == "Game Lines":
     cols = [c for c in cols if c in top.columns]
     st.dataframe(top[cols], use_container_width=True, hide_index=True)
 
-    # ✅ Log Top Picks to Tracker (ADDED)
     if st.button("Log these Top Picks to Tracker"):
         rows = []
         for _, r in top.iterrows():
@@ -994,7 +1236,6 @@ elif mode == "Player Props":
     cols = [c for c in cols if c in top.columns]
     st.dataframe(top[cols], use_container_width=True, hide_index=True)
 
-    # ✅ Log Top Picks to Tracker (ADDED)
     if st.button("Log these Top Picks to Tracker", key="log_props"):
         rows = []
         for _, r in top.iterrows():
@@ -1067,10 +1308,8 @@ else:
         show_cols3 = [c for c in ["Player", "Top10%", "Win%", "SG_T2G", "SG_Putt", "BogeyAvoid", "CourseFit", "CourseHistory", "RecentForm", "SkillRating", "OADScore"] if c in oad.columns]
         st.dataframe(oad[show_cols3], use_container_width=True, hide_index=True)
 
-        # ✅ Log PGA picks to Tracker (ADDED)
         if st.button("Log PGA Top Picks to Tracker"):
             rows = []
-            # Winners
             for _, r in winners.head(10).iterrows():
                 rows.append({
                     "LoggedAt": datetime.now().isoformat(),
@@ -1089,7 +1328,6 @@ else:
                     "Status": "Pending",
                     "Result": "",
                 })
-            # Top10
             for _, r in top10s.head(10).iterrows():
                 rows.append({
                     "LoggedAt": datetime.now().isoformat(),

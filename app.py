@@ -3,12 +3,14 @@ import time
 import re
 from html import unescape
 from datetime import datetime
+
 import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
+from typing import List, Dict, Any, Tuple
 
 # =========================================================
 # Page + Responsive Theme
@@ -63,10 +65,9 @@ div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
 st.markdown(CSS, unsafe_allow_html=True)
 
 # =========================================================
-# Tracker (does not change odds/PGA logic)
+# Tracker (kept identical)
 # =========================================================
 TRACK_FILE = "tracker.csv"
-
 TRACK_COLUMNS = [
     "LoggedAt", "Mode", "Sport", "Market", "Event", "Selection", "Line",
     "BestBook", "BestPrice", "YourProb", "Implied", "Edge", "EV",
@@ -144,7 +145,7 @@ def _summary_pick_rate(df: pd.DataFrame, label: str) -> pd.DataFrame:
     agg.insert(0, "Window", label)
     return agg.sort_values(["Picks","HitRate%"], ascending=False)
 
-def tracker_log_rows(rows: list[dict]):
+def tracker_log_rows(rows: List[Dict[str, Any]]):
     df = _load_tracker()
     add = pd.DataFrame(rows)
     for c in TRACK_COLUMNS:
@@ -171,12 +172,10 @@ def get_key(name: str, default: str = "") -> str:
     return default
 
 ODDS_API_KEY = get_key("ODDS_API_KEY", "")
-DATAGOLF_API_KEY = get_key("DATAGOLF_API_KEY", "")
-if not DATAGOLF_API_KEY:
-    DATAGOLF_API_KEY = get_key("DATAGOLF_KEY", "")
+DATAGOLF_API_KEY = get_key("DATAGOLF_API_KEY", "") or get_key("DATAGOLF_KEY", "")
 
 # =========================================================
-# HTTP
+# HTTP (kept identical, but used by UFC too)
 # =========================================================
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Dashboard/1.0 (streamlit)"})
@@ -193,14 +192,14 @@ def safe_get(url: str, params: dict, timeout: int = 25):
     except Exception as e:
         return False, 0, {"error": str(e)}, url
 
-def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
 def is_list_of_dicts(x):
     return isinstance(x, list) and (len(x) == 0 or isinstance(x[0], dict))
 
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 # =========================================================
-# Odds math
+# Odds math (kept identical)
 # =========================================================
 def american_to_implied(odds) -> float:
     try:
@@ -225,11 +224,11 @@ def line_bucket_half_point(x):
     return round(v * 2.0) / 2.0
 
 # =========================================================
-# API Config (The Odds API)
+# API Config (The Odds API) (kept identical)
 # =========================================================
 ODDS_HOST = "https://api.the-odds-api.com/v4"
 REGION = "us"
-BOOKMAKERS = "draftkings,fanduel"   # ONLY these
+BOOKMAKERS = "draftkings,fanduel"
 
 SPORT_KEYS_LINES = {
     "NFL": "americanfootball_nfl",
@@ -240,13 +239,7 @@ SPORT_KEYS_PROPS = {
     "NFL": "americanfootball_nfl",
     "CFB": "americanfootball_ncaaf",
 }
-
-GAME_MARKETS = {
-    "Moneyline": "h2h",
-    "Spreads": "spreads",
-    "Totals": "totals",
-}
-
+GAME_MARKETS = {"Moneyline": "h2h", "Spreads": "spreads", "Totals": "totals"}
 PROP_MARKETS = {
     "Anytime TD": "player_anytime_td",
     "Passing TDs": "player_pass_tds",
@@ -257,7 +250,7 @@ PROP_MARKETS = {
 }
 
 # =========================================================
-# Sidebar UI
+# Sidebar UI (only change: includes UFC)
 # =========================================================
 st.sidebar.markdown("<div class='big-title'>Dashboard</div>", unsafe_allow_html=True)
 st.sidebar.markdown("<div class='subtle'>EDGE = YourProb − ImpliedProb(best price)</div>", unsafe_allow_html=True)
@@ -266,7 +259,6 @@ st.sidebar.markdown("---")
 debug = st.sidebar.checkbox("Show debug logs", value=False)
 show_non_value = st.sidebar.checkbox("Show non-value rows (Edge ≤ 0)", value=False)
 
-# ✅ Mode options — added UFC without affecting others
 mode = st.sidebar.radio("Mode", ["Game Lines", "Player Props", "PGA", "UFC", "Tracker"], index=0)
 
 with st.sidebar.expander("API Keys (session-only override)", expanded=False):
@@ -285,7 +277,7 @@ st.sidebar.markdown("<span class='pill'>Books: DK + FD</span>", unsafe_allow_htm
 st.sidebar.markdown(f"<span class='pill'>Updated: {now_str()}</span>", unsafe_allow_html=True)
 
 # =========================================================
-# Header
+# Header (kept identical)
 # =========================================================
 st.markdown("<div class='big-title'>EdgeLedger</div>", unsafe_allow_html=True)
 st.caption(
@@ -294,12 +286,13 @@ st.caption(
     "DK/FD only. Game lines / props / PGA run independently."
 )
 
+# IMPORTANT: keep existing behavior; ODDS key required for non-UFC, non-Tracker
 if not ODDS_API_KEY.strip() and mode not in ("Tracker", "UFC"):
     st.error('Missing ODDS_API_KEY. Add it in Streamlit Secrets as ODDS_API_KEY="..." or paste it in the sidebar expander.')
     st.stop()
 
 # =========================================================
-# Caching (daily)
+# Caching (daily) (kept identical)
 # =========================================================
 @st.cache_data(ttl=60 * 60 * 24)
 def fetch_game_lines(sport_key: str):
@@ -335,7 +328,7 @@ def fetch_event_odds(sport_key: str, event_id: str, market_key: str):
     return {"ok": ok, "status": status, "payload": payload, "url": final_url, "params": params}
 
 # =========================================================
-# Normalizers
+# Normalizers (kept identical)
 # =========================================================
 def normalize_lines(raw):
     rows = []
@@ -387,13 +380,11 @@ def normalize_props(event_payload):
             mkey = mk.get("key")
             for out in (mk.get("outcomes", []) or []):
                 player = out.get("name")
-                side = out.get("description")  # Over/Under usually; may be blank
+                side = out.get("description")
                 line = out.get("point")
                 price = out.get("price")
-
                 if player is None or price is None:
                     continue
-
                 rows.append({
                     "Scope": "Prop",
                     "Event": matchup,
@@ -413,7 +404,7 @@ def normalize_props(event_payload):
     return df.dropna(subset=["Market", "Player", "Price"])
 
 # =========================================================
-# Core Best-Bet Logic (Implied vs YourProb)
+# Core Best-Bet Logic (kept identical)
 # =========================================================
 def add_implied(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -493,7 +484,7 @@ def decorate_probs(df_best: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # =========================================================
-# Boards
+# Boards (kept identical)
 # =========================================================
 def build_game_lines_board(sport: str, bet_type: str):
     sport_key = SPORT_KEYS_LINES[sport]
@@ -526,12 +517,9 @@ def build_game_lines_board(sport: str, bet_type: str):
     df = estimate_your_prob(df, key_cols=key_cols, book_cols=book_cols)
     df_best = best_price_and_edge(df, group_cols_best=best_cols)
 
-    contradiction_cols = ["Event", "Market"]
-    df_best = strict_no_contradictions(df_best, contradiction_cols=contradiction_cols)
-
+    df_best = strict_no_contradictions(df_best, contradiction_cols=["Event", "Market"])
     df_best = filter_value(df_best, show_non_value=show_non_value)
-    df_best = decorate_probs(df_best)
-    df_best = df_best.sort_values("Edge", ascending=False)
+    df_best = decorate_probs(df_best).sort_values("Edge", ascending=False)
     return df_best, {}
 
 def build_props_board(sport: str, prop_label: str, max_events_scan: int = 8):
@@ -582,16 +570,13 @@ def build_props_board(sport: str, prop_label: str, max_events_scan: int = 8):
     df = estimate_your_prob(df, key_cols=key_cols, book_cols=book_cols)
     df_best = best_price_and_edge(df, group_cols_best=best_cols)
 
-    contradiction_cols = ["Event", "Market", "Player"]
-    df_best = strict_no_contradictions(df_best, contradiction_cols=contradiction_cols)
-
+    df_best = strict_no_contradictions(df_best, contradiction_cols=["Event", "Market", "Player"])
     df_best = filter_value(df_best, show_non_value=show_non_value)
-    df_best = decorate_probs(df_best)
-    df_best = df_best.sort_values("Edge", ascending=False)
+    df_best = decorate_probs(df_best).sort_values("Edge", ascending=False)
     return df_best, {}
 
 # =========================================================
-# Charts
+# Charts (kept identical)
 # =========================================================
 def bar_prob(df, label_col, prob_col_percent, title):
     if df.empty:
@@ -606,7 +591,7 @@ def bar_prob(df, label_col, prob_col_percent, title):
     st.pyplot(fig)
 
 # =========================================================
-# PGA — Advanced DataGolf Module (independent)
+# PGA — DataGolf (kept identical)
 # =========================================================
 DG_HOST = "https://feeds.datagolf.com"
 
@@ -618,7 +603,6 @@ def _dg_get(path: str, params: dict):
 def _dg_find_rows(payload):
     if isinstance(payload, list) and (len(payload) == 0 or isinstance(payload[0], dict)):
         return payload, {}
-
     if not isinstance(payload, dict):
         return [], {}
 
@@ -777,7 +761,6 @@ def build_pga_board():
 
     df["z_win"] = z(df["WinProb"])
     df["z_top10"] = z(df["Top10Prob"]) if df["Top10Prob"].notna().any() else 0.0
-
     df["z_skill"] = z(df["SkillRating"]) if "SkillRating" in df.columns else 0.0
     df["z_t2g"] = z(df["SG_T2G"]) if "SG_T2G" in df.columns else 0.0
     df["z_putt"] = z(df["SG_Putt"]) if "SG_Putt" in df.columns else 0.0
@@ -795,7 +778,6 @@ def build_pga_board():
         0.06 * df["z_hist"] +
         0.05 * df["z_bogey"]
     )
-
     df["Top10Score"] = (
         0.55 * df["z_top10"] +
         0.12 * df["z_t2g"] +
@@ -805,7 +787,6 @@ def build_pga_board():
         0.06 * df["z_hist"] +
         0.06 * df["z_bogey"]
     )
-
     df["OADScore"] = (
         0.55 * df["Top10Score"] +
         0.25 * df["WinScore"] +
@@ -822,105 +803,83 @@ def build_pga_board():
     return {"winners": winners, "top10s": top10s, "oad": oad, "meta": meta}, {}
 
 # =========================================================
-# UFC Module (FIXED: HTTPS + regex accepts http/https; no lxml; no csv)
+# UFC Module (NEW FIXES — minimal-risk; no lxml; no csv)
+# - Primary source: UFCStats upcoming list (https + http fallback)
+# - Secondary fallback: completed list (in case upcoming is empty/blocked)
+# - Regex parsing only; no external deps
+# - Adds a "Force refresh UFC cache" button to solve stale/no-event issues
 # =========================================================
-UFC_BASE_HTTPS = "https://ufcstats.com"
-UFC_BASE_HTTP = "http://ufcstats.com"
+UFC_UPCOMING = "https://ufcstats.com/statistics/events/upcoming?page=all"
+UFC_UPCOMING_HTTP = "http://ufcstats.com/statistics/events/upcoming?page=all"
+UFC_COMPLETED = "https://ufcstats.com/statistics/events/completed?page=all"
+UFC_COMPLETED_HTTP = "http://ufcstats.com/statistics/events/completed?page=all"
 
-def ufc_fetch_html(url: str, timeout: int = 25) -> str:
-    headers = {
+def _ufc_headers():
+    return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
-        "Referer": UFC_BASE_HTTPS + "/statistics/events/upcoming?page=all",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
+
+def ufc_fetch_html(url: str, timeout: int = 25) -> str:
+    # Hard guard: UFC should never take down the whole app
     try:
-        r = SESSION.get(url, timeout=timeout, headers=headers, allow_redirects=True)
+        r = SESSION.get(url, headers=_ufc_headers(), timeout=timeout, allow_redirects=True)
         r.raise_for_status()
         return r.text or ""
-    except Exception as e1:
-        if url.startswith("https://"):
-            url2 = "http://" + url[len("https://"):]
-            r2 = SESSION.get(url2, timeout=timeout, headers=headers, allow_redirects=True)
-            r2.raise_for_status()
-            return r2.text or ""
-        raise e1
+    except Exception:
+        # allow caller to try other URLs
+        return ""
 
-def _extract_rows_events(html: str):
-    out = []
-
-    # Robust row parse: grab event-details links and their nearby date
-    # UFCStats structure: link -> ... -> <td class="b-statistics__date">Month Day, Year</td>
-    row_pat = re.compile(
+def _parse_events(html: str) -> pd.DataFrame:
+    # Event listing table: anchor to event-details + date column
+    # We accept both http and https in the href
+    pat = re.compile(
         r'<a[^>]+href="(?P<url>https?://ufcstats\.com/event-details/[^"]+)"[^>]*>\s*(?P<name>[^<]+)\s*</a>'
         r'.*?<td[^>]*class="b-statistics__date"[^>]*>\s*(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\s*</td>',
-        flags=re.I | re.S
+        flags=re.I | re.S,
     )
 
-    for m in row_pat.finditer(html):
+    rows = []
+    for m in pat.finditer(html):
         name = unescape(m.group("name")).strip()
         date_raw = unescape(m.group("date")).strip()
         dt = pd.to_datetime(date_raw, errors="coerce")
-        if pd.isna(dt):
+        rows.append({"Event": name, "Date": dt, "DateStr": date_raw, "EventURL": m.group("url").strip()})
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.drop_duplicates(subset=["EventURL"]).reset_index(drop=True)
+    return df
+
+@st.cache_data(ttl=60 * 20)
+def ufc_list_events_cached() -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    notes = {"sources_tried": [], "found": 0}
+
+    for u in [UFC_UPCOMING, UFC_UPCOMING_HTTP, UFC_COMPLETED, UFC_COMPLETED_HTTP]:
+        html = ufc_fetch_html(u)
+        notes["sources_tried"].append({"url": u, "bytes": len(html or "")})
+        if not html:
             continue
-        out.append({
-            "Event": name,
-            "Date": dt,
-            "DateStr": dt.strftime("%Y-%m-%d"),
-            "EventURL": m.group("url").strip()
-        })
+        df = _parse_events(html)
+        if not df.empty:
+            notes["found"] = int(len(df))
+            # Sort: upcoming page is usually future; for safety sort by date desc
+            if df["Date"].notna().any():
+                df = df.sort_values("Date", ascending=False)
+            return df.reset_index(drop=True), notes
 
-    # Fallback: if class names changed, just pull all event-details links and then attempt to pull any nearby date
-    if not out:
-        link_pat = re.compile(r'href="(?P<url>https?://ufcstats\.com/event-details/[^"]+)"', flags=re.I)
-        urls = []
-        for m in link_pat.finditer(html):
-            urls.append(m.group("url").strip())
-        urls = list(dict.fromkeys(urls))
-        for u in urls:
-            out.append({"Event": u.split("/")[-1], "Date": pd.NaT, "DateStr": "", "EventURL": u})
+    return pd.DataFrame(columns=["Event", "Date", "DateStr", "EventURL"]), notes
 
-    return out
-
-@st.cache_data(ttl=60 * 60 * 2)
-def ufc_list_events(limit: int = 25) -> pd.DataFrame:
-    pages = [
-        UFC_BASE_HTTPS + "/statistics/events/upcoming?page=all",
-        UFC_BASE_HTTP + "/statistics/events/upcoming?page=all",
-        UFC_BASE_HTTPS + "/statistics/events/completed?page=all",
-        UFC_BASE_HTTP + "/statistics/events/completed?page=all",
-    ]
-
-    last_err = None
-    df_final = pd.DataFrame()
-    for url in pages:
-        try:
-            html = ufc_fetch_html(url)
-            rows = _extract_rows_events(html)
-            df = pd.DataFrame(rows)
-            if not df.empty:
-                # If we got real dates, prefer upcoming page to catch "tomorrow"
-                if df["Date"].notna().any():
-                    df = df.sort_values("Date", ascending=False).reset_index(drop=True)
-                df_final = df
-                break
-        except Exception as e:
-            last_err = str(e)
-
-    if df_final.empty:
-        return pd.DataFrame(columns=["Event", "Date", "DateStr", "EventURL"])
-
-    # Prefer rows that have dates, but keep if missing
-    if "Date" in df_final.columns and df_final["Date"].notna().any():
-        df_final = df_final.sort_values("Date", ascending=False)
-
-    df_final = df_final.head(int(limit)).reset_index(drop=True)
-    return df_final
-
-def _extract_fight_rows(event_html: str):
+def _parse_event_fights(event_html: str) -> List[Dict[str, str]]:
     fights = []
     row_pat = re.compile(
         r'<a[^>]+href="(?P<fight>https?://ufcstats\.com/fight-details/[^"]+)"[^>]*>.*?</a>.*?'
@@ -946,7 +905,18 @@ def _extract_fight_rows(event_html: str):
         uniq.append(f)
     return uniq
 
-def _extract_fighter_profile(html: str):
+@st.cache_data(ttl=60 * 20)
+def ufc_get_event_fights(event_url: str) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    meta = {"event_url": event_url, "bytes": 0}
+    html = ufc_fetch_html(event_url)
+    meta["bytes"] = len(html or "")
+    if not html:
+        return [], meta
+    fights = _parse_event_fights(html)
+    meta["fights_found"] = len(fights)
+    return fights, meta
+
+def _extract_fighter_profile(html: str) -> Dict[str, Any]:
     def pick(pattern):
         m = re.search(pattern, html, flags=re.I | re.S)
         return unescape(m.group(1)).strip() if m else ""
@@ -954,7 +924,6 @@ def _extract_fighter_profile(html: str):
     name = pick(r'<span[^>]*class="b-content__title-highlight"[^>]*>\s*([^<]+)\s*</span>')
     record = pick(r'<span[^>]*class="b-content__title-record"[^>]*>[^:]*:\s*([^<]+)</span>')
 
-    height = pick(r'Height:\s*</i>\s*([^<]+)<')
     reach = pick(r'Reach:\s*</i>\s*([^<]+)<')
     stance = pick(r'STANCE:\s*</i>\s*([^<]+)<')
     dob = pick(r'DOB:\s*</i>\s*([^<]+)<')
@@ -969,7 +938,6 @@ def _extract_fighter_profile(html: str):
             continue
         label = km.group(1).strip()
         val = km.group(2).strip()
-
         mapping = {
             "SLpM": "SLpM",
             "Str. Acc.": "StrAcc",
@@ -1003,7 +971,6 @@ def _extract_fighter_profile(html: str):
         "Name": name,
         "Record": record,
         "W": w, "L": l, "D": d,
-        "HeightRaw": height,
         "ReachIn": parse_inches(reach),
         "Stance": stance,
         "DOB": dob,
@@ -1018,7 +985,7 @@ def _extract_fighter_profile(html: str):
         "SubAvg": stats.get("SubAvg", np.nan),
     }
 
-def _coerce_profile(p: dict) -> dict:
+def _coerce_profile(p: Dict[str, Any]) -> Dict[str, Any]:
     def to_num(x):
         if x is None:
             return np.nan
@@ -1044,11 +1011,21 @@ def _coerce_profile(p: dict) -> dict:
     p["D"] = pd.to_numeric(p.get("D"), errors="coerce")
     return p
 
-def _sigmoid(x):
-    x = float(x)
-    return 1.0 / (1.0 + np.exp(-x))
+@st.cache_data(ttl=60 * 60)
+def ufc_get_fighter_profile(url: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    meta = {"url": url, "bytes": 0}
+    html = ufc_fetch_html(url)
+    meta["bytes"] = len(html or "")
+    if not html:
+        return {"Name": "", "Age": np.nan, "ReachIn": np.nan, "Stance": "", "Record": "", "W": np.nan, "L": np.nan, "D": np.nan,
+                "SLpM": np.nan, "StrAcc": np.nan, "SApM": np.nan, "StrDef": np.nan, "TDAvg": np.nan, "TDAcc": np.nan, "TDDef": np.nan, "SubAvg": np.nan}, meta
+    prof = _extract_fighter_profile(html)
+    return prof, meta
 
-def ufc_predict_fight(red: dict, blue: dict):
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + np.exp(-float(x)))
+
+def ufc_predict(red: Dict[str, Any], blue: Dict[str, Any]) -> Dict[str, Any]:
     r = _coerce_profile(dict(red))
     b = _coerce_profile(dict(blue))
 
@@ -1057,6 +1034,8 @@ def ufc_predict_fight(red: dict, blue: dict):
         if pd.isna(w) or pd.isna(l) or (w + l) <= 0:
             return 0.5
         return float(w) / float(w + l)
+
+    def nz(x): return 0.0 if pd.isna(x) else float(x)
 
     r_wr = win_rate(r)
     b_wr = win_rate(b)
@@ -1070,32 +1049,21 @@ def ufc_predict_fight(red: dict, blue: dict):
         elif ("orthodox" in rs) and ("southpaw" in bs):
             stance_edge = -0.03
 
-    def nz(x): return 0.0 if pd.isna(x) else float(x)
-
-    d_reach = nz((r.get("ReachIn", np.nan) - b.get("ReachIn", np.nan)))
-    d_age = nz((r.get("Age", np.nan) - b.get("Age", np.nan)))
-    d_slpm = nz((r.get("SLpM", np.nan) - b.get("SLpM", np.nan)))
-    d_sapm = nz((r.get("SApM", np.nan) - b.get("SApM", np.nan)))
-    d_stracc = nz((r.get("StrAcc", np.nan) - b.get("StrAcc", np.nan)))
-    d_strdef = nz((r.get("StrDef", np.nan) - b.get("StrDef", np.nan)))
-    d_tdavg = nz((r.get("TDAvg", np.nan) - b.get("TDAvg", np.nan)))
-    d_tdacc = nz((r.get("TDAcc", np.nan) - b.get("TDAcc", np.nan)))
-    d_tddef = nz((r.get("TDDef", np.nan) - b.get("TDDef", np.nan)))
-    d_subavg = nz((r.get("SubAvg", np.nan) - b.get("SubAvg", np.nan)))
-    d_wr = nz(r_wr - b_wr)
+    d_reach = nz(r.get("ReachIn") - b.get("ReachIn")) if (pd.notna(r.get("ReachIn")) and pd.notna(b.get("ReachIn"))) else 0.0
+    d_age = nz(r.get("Age") - b.get("Age")) if (pd.notna(r.get("Age")) and pd.notna(b.get("Age"))) else 0.0
 
     score = (
         0.06 * (d_reach / 5.0) +
         -0.07 * (d_age / 5.0) +
-        0.10 * (d_slpm / 2.0) +
-        -0.10 * (d_sapm / 2.0) +
-        0.08 * (d_stracc / 0.10) +
-        0.08 * (d_strdef / 0.10) +
-        0.08 * (d_tdavg / 2.0) +
-        0.08 * (d_tdacc / 0.10) +
-        0.09 * (d_tddef / 0.10) +
-        0.04 * (d_subavg / 1.0) +
-        0.20 * (d_wr / 0.20) +
+        0.10 * ((nz(r.get("SLpM")) - nz(b.get("SLpM"))) / 2.0) +
+        -0.10 * ((nz(r.get("SApM")) - nz(b.get("SApM"))) / 2.0) +
+        0.08 * ((nz(r.get("StrAcc")) - nz(b.get("StrAcc"))) / 0.10) +
+        0.08 * ((nz(r.get("StrDef")) - nz(b.get("StrDef"))) / 0.10) +
+        0.08 * ((nz(r.get("TDAvg")) - nz(b.get("TDAvg"))) / 2.0) +
+        0.08 * ((nz(r.get("TDAcc")) - nz(b.get("TDAcc"))) / 0.10) +
+        0.09 * ((nz(r.get("TDDef")) - nz(b.get("TDDef"))) / 0.10) +
+        0.04 * ((nz(r.get("SubAvg")) - nz(b.get("SubAvg"))) / 1.0) +
+        0.20 * ((nz(r_wr - b_wr)) / 0.20) +
         stance_edge
     )
 
@@ -1103,139 +1071,131 @@ def ufc_predict_fight(red: dict, blue: dict):
     red_name = r.get("Name") or "Red"
     blue_name = b.get("Name") or "Blue"
 
-    if p_red < 0.5:
-        pick = blue_name
-        p = 1.0 - p_red
-    else:
+    if p_red >= 0.5:
         pick = red_name
         p = p_red
+    else:
+        pick = blue_name
+        p = 1.0 - p_red
 
+    # Heuristic: finish likelihood (proxy using volume + grappling activity)
     finish_score = (
         0.35 * (nz(r.get("SLpM")) + nz(b.get("SLpM"))) / 10.0 +
         0.35 * (nz(r.get("TDAvg")) + nz(b.get("TDAvg"))) / 8.0 +
         0.30 * (nz(r.get("SubAvg")) + nz(b.get("SubAvg"))) / 4.0
     )
     p_finish = float(np.clip(finish_score, 0.15, 0.75))
-    p_dec = 1.0 - p_finish
 
     return {
         "Pick": pick,
-        "Prob": float(np.clip(p, 0.52, 0.80)),
+        "WinProb": float(np.clip(p, 0.52, 0.80)),
         "Finish%": round(p_finish * 100.0, 1),
-        "Decision%": round(p_dec * 100.0, 1),
+        "Decision%": round((1.0 - p_finish) * 100.0, 1),
         "Score": float(score),
         "Red": red_name,
         "Blue": blue_name,
     }
 
-@st.cache_data(ttl=60 * 30)
-def ufc_get_event_card(event_url: str):
-    ev_html = ufc_fetch_html(event_url)
-    fights = _extract_fight_rows(ev_html)
-    return fights
-
-@st.cache_data(ttl=60 * 60)
-def ufc_get_fighter_profile(fighter_url: str):
-    html = ufc_fetch_html(fighter_url)
-    prof = _extract_fighter_profile(html)
-    return prof
-
 def render_ufc():
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("🥊 UFC — Fight Picks (UFCStats)")
-    st.caption("UFCStats upcoming-first. Model uses age/reach/stance/record + striking + takedowns. Finish/Decision is heuristic.")
+    st.caption("Uses UFCStats (upcoming-first). Model uses age/reach/stance/record + striking + takedowns. Finish/Decision is a heuristic proxy.")
 
-    events = ufc_list_events(limit=40)
-    if events.empty:
-        st.warning("No UFC events found from UFCStats (upcoming/completed).")
-        if debug:
-            st.json({
-                "try_in_browser": [
-                    UFC_BASE_HTTPS + "/statistics/events/upcoming?page=all",
-                    UFC_BASE_HTTP + "/statistics/events/upcoming?page=all",
-                    UFC_BASE_HTTPS + "/statistics/events/completed?page=all",
-                ],
-                "note": "If these load in browser but not in the app host, outbound access may be restricted."
-            })
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
+    # This solves “tomorrow card exists but app shows none” due to caching/stale fetch
+    colA, colB = st.columns([1, 3])
+    with colA:
+        if st.button("Force refresh UFC"):
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.rerun()
 
-    # Prefer upcoming (closest future) if dates exist
-    if events["Date"].notna().any():
-        now = pd.Timestamp.now(tz=None)
-        future = events[events["Date"] >= now.normalize()].copy()
-        if not future.empty:
-            future = future.sort_values("Date", ascending=True)
-            pick_df = pd.concat([future, events[~events.index.isin(future.index)]], ignore_index=True)
-            events = pick_df.drop_duplicates(subset=["EventURL"], keep="first")
-
-    opts = (events["DateStr"].fillna("").astype(str) + " — " + events["Event"].astype(str)).tolist()
-    # Default to first row (likely closest upcoming)
-    sel = st.selectbox("Select UFC Event", opts, index=0, key="ufc_event_select")
-    sel_idx = opts.index(sel)
-    ev_url = events.loc[sel_idx, "EventURL"]
+    events, notes = ufc_list_events_cached()
 
     if debug:
-        st.json({"selected_event_url": ev_url})
+        st.json(notes)
 
-    try:
-        fights = ufc_get_event_card(ev_url)
-    except Exception as e:
-        st.error(f"Could not load event card: {e}")
+    if events.empty:
+        st.warning("No UFC events found from UFCStats (upcoming/completed).")
+        st.caption("If UFCStats loads in your browser but not in Streamlit, your host may block outbound requests to that domain.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
+
+    # Prefer closest upcoming if we have usable dates
+    events2 = events.copy()
+    if events2["Date"].notna().any():
+        now = pd.Timestamp.now().normalize()
+        future = events2[events2["Date"] >= now].copy()
+        if not future.empty:
+            future = future.sort_values("Date", ascending=True)
+            rest = events2[~events2.index.isin(future.index)]
+            events2 = pd.concat([future, rest], ignore_index=True).drop_duplicates(subset=["EventURL"], keep="first")
+
+    # Build select options
+    def fmt_row(r):
+        d = r.get("Date")
+        if pd.notna(d):
+            return f"{pd.to_datetime(d).strftime('%Y-%m-%d')} — {r.get('Event','')}"
+        ds = str(r.get("DateStr") or "").strip()
+        return f"{ds} — {r.get('Event','')}".strip(" —")
+
+    options = [fmt_row(row) for _, row in events2.iterrows()]
+    idx = st.selectbox("Select UFC Event", list(range(len(options))), format_func=lambda i: options[i], index=0)
+    ev_url = str(events2.iloc[idx]["EventURL"])
+
+    fights, meta = ufc_get_event_fights(ev_url)
+    if debug:
+        st.json(meta)
 
     if not fights:
         st.warning("No fights parsed on this event page (HTML changed or blocked).")
-        if debug:
-            st.json({"event_url": ev_url})
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
     rows = []
-    failures = 0
+    prof_fail = 0
     for f in fights:
-        try:
-            r_prof = ufc_get_fighter_profile(f["RedURL"])
-            b_prof = ufc_get_fighter_profile(f["BlueURL"])
-            pred = ufc_predict_fight(r_prof, b_prof)
-
-            rows.append({
-                "Fight": f"{pred['Red']} vs {pred['Blue']}",
-                "Pick": pred["Pick"],
-                "WinProb%": round(pred["Prob"] * 100.0, 1),
-                "Finish%": pred["Finish%"],
-                "Decision%": pred["Decision%"],
-                "Red_Age": round(float(pd.to_numeric(r_prof.get("Age"), errors="coerce")), 1) if pd.notna(pd.to_numeric(r_prof.get("Age"), errors="coerce")) else np.nan,
-                "Blue_Age": round(float(pd.to_numeric(b_prof.get("Age"), errors="coerce")), 1) if pd.notna(pd.to_numeric(b_prof.get("Age"), errors="coerce")) else np.nan,
-                "Red_Reach": pd.to_numeric(r_prof.get("ReachIn"), errors="coerce"),
-                "Blue_Reach": pd.to_numeric(b_prof.get("ReachIn"), errors="coerce"),
-                "Red_Stance": r_prof.get("Stance", ""),
-                "Blue_Stance": b_prof.get("Stance", ""),
-                "Red_Record": r_prof.get("Record", ""),
-                "Blue_Record": b_prof.get("Record", ""),
-            })
-        except Exception:
-            failures += 1
+        r_prof, r_meta = ufc_get_fighter_profile(f["RedURL"])
+        b_prof, b_meta = ufc_get_fighter_profile(f["BlueURL"])
+        if (r_meta.get("bytes", 0) == 0) or (b_meta.get("bytes", 0) == 0):
+            prof_fail += 1
+            continue
+        pred = ufc_predict(r_prof, b_prof)
+        rows.append({
+            "Fight": f"{pred['Red']} vs {pred['Blue']}",
+            "Pick": pred["Pick"],
+            "WinProb%": round(pred["WinProb"] * 100.0, 1),
+            "Finish%": pred["Finish%"],
+            "Decision%": pred["Decision%"],
+            "Red_Age": round(float(pd.to_numeric(r_prof.get("Age"), errors="coerce")), 1) if pd.notna(pd.to_numeric(r_prof.get("Age"), errors="coerce")) else np.nan,
+            "Blue_Age": round(float(pd.to_numeric(b_prof.get("Age"), errors="coerce")), 1) if pd.notna(pd.to_numeric(b_prof.get("Age"), errors="coerce")) else np.nan,
+            "Red_Reach": pd.to_numeric(r_prof.get("ReachIn"), errors="coerce"),
+            "Blue_Reach": pd.to_numeric(b_prof.get("ReachIn"), errors="coerce"),
+            "Red_Stance": r_prof.get("Stance", ""),
+            "Blue_Stance": b_prof.get("Stance", ""),
+            "Red_Record": r_prof.get("Record", ""),
+            "Blue_Record": b_prof.get("Record", ""),
+        })
         time.sleep(0.03)
 
     if not rows:
-        st.warning("Could not compute predictions (all fighter pages failed).")
+        st.warning("Could not compute predictions (fighter pages failed to load).")
         if debug:
-            st.json({"fights_found": len(fights), "fighter_page_failures": failures})
+            st.json({"fighter_page_failures": prof_fail, "fights_total": len(fights)})
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
     df = pd.DataFrame(rows).sort_values("WinProb%", ascending=False).reset_index(drop=True)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    if debug and failures:
-        st.info(f"Skipped {failures} fight(s) due to fetch/parse failures.")
+    if debug and prof_fail:
+        st.info(f"Skipped {prof_fail} fight(s) due to fighter page load failures.")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================================================
-# Tracker Page UI
+# Tracker UI (kept identical)
 # =========================================================
 def render_tracker():
     st.markdown("<div class='card'>", unsafe_allow_html=True)

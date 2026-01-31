@@ -1,9 +1,8 @@
 import os
 import time
 import re
-from datetime import datetime
 from html import unescape
-
+from datetime import datetime
 import requests
 import numpy as np
 import pandas as pd
@@ -64,9 +63,10 @@ div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
 st.markdown(CSS, unsafe_allow_html=True)
 
 # =========================================================
-# Tracker (does not change odds/PGA/UFC logic)
+# Tracker (does not change odds/PGA logic)
 # =========================================================
 TRACK_FILE = "tracker.csv"
+
 TRACK_COLUMNS = [
     "LoggedAt", "Mode", "Sport", "Market", "Event", "Selection", "Line",
     "BestBook", "BestPrice", "YourProb", "Implied", "Edge", "EV",
@@ -193,11 +193,11 @@ def safe_get(url: str, params: dict, timeout: int = 25):
     except Exception as e:
         return False, 0, {"error": str(e)}, url
 
-def is_list_of_dicts(x):
-    return isinstance(x, list) and (len(x) == 0 or isinstance(x[0], dict))
-
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def is_list_of_dicts(x):
+    return isinstance(x, list) and (len(x) == 0 or isinstance(x[0], dict))
 
 # =========================================================
 # Odds math
@@ -266,7 +266,7 @@ st.sidebar.markdown("---")
 debug = st.sidebar.checkbox("Show debug logs", value=False)
 show_non_value = st.sidebar.checkbox("Show non-value rows (Edge ≤ 0)", value=False)
 
-# ✅ Radio buttons (mobile-friendly via CSS above)
+# ✅ Mode options — added UFC without affecting others
 mode = st.sidebar.radio("Mode", ["Game Lines", "Player Props", "PGA", "UFC", "Tracker"], index=0)
 
 with st.sidebar.expander("API Keys (session-only override)", expanded=False):
@@ -429,11 +429,6 @@ def compute_no_vig_within_book_two_way(df: pd.DataFrame, group_cols_book: list) 
     return out
 
 def estimate_your_prob(df: pd.DataFrame, key_cols: list, book_cols: list) -> pd.DataFrame:
-    """
-    YourProb:
-    - two-way: no-vig within each book, avg across books
-    - one-way: market-consensus avg implied across books (enables value by shopping)
-    """
     if df.empty:
         return df.copy()
 
@@ -472,11 +467,6 @@ def best_price_and_edge(df: pd.DataFrame, group_cols_best: list) -> pd.DataFrame
     return best
 
 def strict_no_contradictions(df_best: pd.DataFrame, contradiction_cols: list) -> pd.DataFrame:
-    """
-    STRICT contradiction removal:
-    Keep exactly ONE row per contradiction group (max Edge), ignoring line differences.
-    This eliminates contradictions within DK, within FD, and across DK+FD simultaneously.
-    """
     if df_best.empty:
         return df_best
     out = df_best.copy()
@@ -703,7 +693,6 @@ def build_pga_board():
         return pd.DataFrame(), {"error": "No PGA prediction rows returned from DataGolf (parsed none).", "dg_meta": meta}
 
     df_pre = pd.DataFrame(pre_rows)
-
     name_col = _first_col(df_pre, ["player_name", "name", "golfer", "player"])
     if not name_col:
         return pd.DataFrame(), {"error": "Could not find player name column in DataGolf pre-tournament payload."}
@@ -722,7 +711,6 @@ def build_pga_board():
 
     df_pre["Player"] = df_pre[name_col].astype(str)
     df_pre["PlayerKey"] = df_pre["Player"].apply(_normalize_name)
-
     df_pre["WinProb"] = pd.to_numeric(df_pre[win_col], errors="coerce") / 100.0
     df_pre["Top10Prob"] = pd.to_numeric(df_pre[top10_col], errors="coerce") / 100.0 if top10_col else np.nan
 
@@ -834,25 +822,44 @@ def build_pga_board():
     return {"winners": winners, "top10s": top10s, "oad": oad, "meta": meta}, {}
 
 # =========================================================
-# UFC Module (NO lxml / NO csv) — Only UFC change: upcoming events
+# UFC Module (FIXED: HTTPS + regex accepts http/https; no lxml; no csv)
 # =========================================================
-UFC_BASE = "http://ufcstats.com"
+UFC_BASE_HTTPS = "https://ufcstats.com"
+UFC_BASE_HTTP = "http://ufcstats.com"
 
 def ufc_fetch_html(url: str, timeout: int = 25) -> str:
-    r = SESSION.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.text or ""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "Referer": UFC_BASE_HTTPS + "/statistics/events/upcoming?page=all",
+    }
+    try:
+        r = SESSION.get(url, timeout=timeout, headers=headers, allow_redirects=True)
+        r.raise_for_status()
+        return r.text or ""
+    except Exception as e1:
+        if url.startswith("https://"):
+            url2 = "http://" + url[len("https://"):]
+            r2 = SESSION.get(url2, timeout=timeout, headers=headers, allow_redirects=True)
+            r2.raise_for_status()
+            return r2.text or ""
+        raise e1
 
 def _extract_rows_events(html: str):
-    """
-    Flexible regex to parse UFCStats events list (works for upcoming + completed).
-    """
     out = []
+
+    # Robust row parse: grab event-details links and their nearby date
+    # UFCStats structure: link -> ... -> <td class="b-statistics__date">Month Day, Year</td>
     row_pat = re.compile(
-        r'<a[^>]+href="(?P<url>http://ufcstats\.com/event-details/[^"]+)"[^>]*>\s*(?P<name>[^<]+)\s*</a>.*?'
-        r'<td[^>]*>\s*(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\s*</td>',
+        r'<a[^>]+href="(?P<url>https?://ufcstats\.com/event-details/[^"]+)"[^>]*>\s*(?P<name>[^<]+)\s*</a>'
+        r'.*?<td[^>]*class="b-statistics__date"[^>]*>\s*(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\s*</td>',
         flags=re.I | re.S
     )
+
     for m in row_pat.finditer(html):
         name = unescape(m.group("name")).strip()
         date_raw = unescape(m.group("date")).strip()
@@ -865,56 +872,63 @@ def _extract_rows_events(html: str):
             "DateStr": dt.strftime("%Y-%m-%d"),
             "EventURL": m.group("url").strip()
         })
+
+    # Fallback: if class names changed, just pull all event-details links and then attempt to pull any nearby date
+    if not out:
+        link_pat = re.compile(r'href="(?P<url>https?://ufcstats\.com/event-details/[^"]+)"', flags=re.I)
+        urls = []
+        for m in link_pat.finditer(html):
+            urls.append(m.group("url").strip())
+        urls = list(dict.fromkeys(urls))
+        for u in urls:
+            out.append({"Event": u.split("/")[-1], "Date": pd.NaT, "DateStr": "", "EventURL": u})
+
     return out
 
 @st.cache_data(ttl=60 * 60 * 2)
 def ufc_list_events(limit: int = 25) -> pd.DataFrame:
-    """
-    ✅ FIX: Prefer UPCOMING events so tomorrow's card appears.
-    Fallback to COMPLETED if upcoming is empty.
-    """
     pages = [
-        f"{UFC_BASE}/statistics/events/upcoming?page=all",
-        f"{UFC_BASE}/statistics/events/completed?page=all",
+        UFC_BASE_HTTPS + "/statistics/events/upcoming?page=all",
+        UFC_BASE_HTTP + "/statistics/events/upcoming?page=all",
+        UFC_BASE_HTTPS + "/statistics/events/completed?page=all",
+        UFC_BASE_HTTP + "/statistics/events/completed?page=all",
     ]
 
-    all_rows = []
     last_err = None
+    df_final = pd.DataFrame()
     for url in pages:
         try:
             html = ufc_fetch_html(url)
             rows = _extract_rows_events(html)
-            if rows:
-                all_rows = rows
+            df = pd.DataFrame(rows)
+            if not df.empty:
+                # If we got real dates, prefer upcoming page to catch "tomorrow"
+                if df["Date"].notna().any():
+                    df = df.sort_values("Date", ascending=False).reset_index(drop=True)
+                df_final = df
                 break
         except Exception as e:
-            last_err = e
-            continue
+            last_err = str(e)
 
-    df = pd.DataFrame(all_rows)
-    if df.empty:
-        # keep schema stable
+    if df_final.empty:
         return pd.DataFrame(columns=["Event", "Date", "DateStr", "EventURL"])
 
-    # Normalize sorting: newest first (still includes tomorrow, since upcoming will be present)
-    df = df.sort_values("Date", ascending=False).head(int(limit)).reset_index(drop=True)
-    return df
+    # Prefer rows that have dates, but keep if missing
+    if "Date" in df_final.columns and df_final["Date"].notna().any():
+        df_final = df_final.sort_values("Date", ascending=False)
 
-def _extract_fight_rows(html: str):
-    """
-    Parse fight cards from event-details page.
-    Returns list of dicts: Bout, WeightClass, Method, Round, Time, Red, Blue, RedURL, BlueURL
-    """
+    df_final = df_final.head(int(limit)).reset_index(drop=True)
+    return df_final
+
+def _extract_fight_rows(event_html: str):
     fights = []
-    # fight-details link with fighters
-    # UFCStats uses table rows with: fight-details link + 2 fighter links
     row_pat = re.compile(
-        r'<a[^>]+href="(?P<fight>http://ufcstats\.com/fight-details/[^"]+)"[^>]*>.*?</a>.*?'
-        r'<a[^>]+href="(?P<red>http://ufcstats\.com/fighter-details/[^"]+)"[^>]*>\s*(?P<red_name>[^<]+)\s*</a>.*?'
-        r'<a[^>]+href="(?P<blue>http://ufcstats\.com/fighter-details/[^"]+)"[^>]*>\s*(?P<blue_name>[^<]+)\s*</a>',
+        r'<a[^>]+href="(?P<fight>https?://ufcstats\.com/fight-details/[^"]+)"[^>]*>.*?</a>.*?'
+        r'<a[^>]+href="(?P<red>https?://ufcstats\.com/fighter-details/[^"]+)"[^>]*>\s*(?P<red_name>[^<]+)\s*</a>.*?'
+        r'<a[^>]+href="(?P<blue>https?://ufcstats\.com/fighter-details/[^"]+)"[^>]*>\s*(?P<blue_name>[^<]+)\s*</a>',
         flags=re.I | re.S
     )
-    for m in row_pat.finditer(html):
+    for m in row_pat.finditer(event_html):
         fights.append({
             "FightURL": m.group("fight").strip(),
             "RedURL": m.group("red").strip(),
@@ -922,23 +936,17 @@ def _extract_fight_rows(html: str):
             "Red": unescape(m.group("red_name")).strip(),
             "Blue": unescape(m.group("blue_name")).strip(),
         })
-    # de-dupe by fight url
-    if fights:
-        seen = set()
-        uniq = []
-        for f in fights:
-            if f["FightURL"] in seen:
-                continue
-            seen.add(f["FightURL"])
-            uniq.append(f)
-        fights = uniq
-    return fights
+
+    seen = set()
+    uniq = []
+    for f in fights:
+        if f["FightURL"] in seen:
+            continue
+        seen.add(f["FightURL"])
+        uniq.append(f)
+    return uniq
 
 def _extract_fighter_profile(html: str):
-    """
-    Pull basics from fighter-details page (name, height, reach, stance, dob, record).
-    Regex-only, no lxml.
-    """
     def pick(pattern):
         m = re.search(pattern, html, flags=re.I | re.S)
         return unescape(m.group(1)).strip() if m else ""
@@ -946,31 +954,22 @@ def _extract_fighter_profile(html: str):
     name = pick(r'<span[^>]*class="b-content__title-highlight"[^>]*>\s*([^<]+)\s*</span>')
     record = pick(r'<span[^>]*class="b-content__title-record"[^>]*>[^:]*:\s*([^<]+)</span>')
 
-    # labels in list items
     height = pick(r'Height:\s*</i>\s*([^<]+)<')
     reach = pick(r'Reach:\s*</i>\s*([^<]+)<')
     stance = pick(r'STANCE:\s*</i>\s*([^<]+)<')
     dob = pick(r'DOB:\s*</i>\s*([^<]+)<')
 
-    # totals table (SLpM, StrAcc, SApM, StrDef, TDAvg, TDAcc, TDDef, SubAvg)
-    stats = {}
-    stat_keys = ["SLpM","StrAcc","SApM","StrDef","TDAvg","TDAcc","TDDef","SubAvg"]
-    for k in stat_keys:
-        stats[k] = np.nan
+    stats = {k: np.nan for k in ["SLpM","StrAcc","SApM","StrDef","TDAvg","TDAcc","TDDef","SubAvg"]}
 
-    # This table is stable: first occurrence of these values row
-    # Grab all <li class="b-list__box-list-item b-list__box-list-item_type_block"> ... </li>
-    # Then key is in <i>LABEL:</i> VALUE
     li_pat = re.compile(r'<li[^>]*class="b-list__box-list-item[^"]*">\s*(.*?)</li>', flags=re.I | re.S)
     for li in li_pat.findall(html):
-        # normalize whitespace
         li2 = re.sub(r"\s+", " ", li)
-        km = re.search(r'<i[^>]*>\s*([A-Za-z0-9\.% ]+):\s*</i>\s*([^<]+)', li2, flags=re.I)
+        km = re.search(r'<i[^>]*>\s*([A-Za-z0-9\.\%\s]+):\s*</i>\s*([^<]+)', li2, flags=re.I)
         if not km:
             continue
         label = km.group(1).strip()
         val = km.group(2).strip()
-        # Map UFC labels to keys
+
         mapping = {
             "SLpM": "SLpM",
             "Str. Acc.": "StrAcc",
@@ -984,41 +983,23 @@ def _extract_fighter_profile(html: str):
         if label in mapping:
             stats[mapping[label]] = val
 
-    def to_float(x):
-        if x is None:
-            return np.nan
-        s = str(x).strip()
-        if not s or s in ("--", "N/A"):
-            return np.nan
-        # percent
-        if s.endswith("%"):
-            try:
-                return float(s.replace("%","")) / 100.0
-            except Exception:
-                return np.nan
-        # feet/inches for height like 5' 10"
-        return s
-
-    # Parse reach like 72"
     def parse_inches(s):
         if not isinstance(s, str):
             return np.nan
         m = re.search(r'(\d+(\.\d+)?)', s)
         return float(m.group(1)) if m else np.nan
 
-    # Parse DOB like "May 07, 1992"
     dob_dt = pd.to_datetime(dob, errors="coerce")
     age = np.nan
     if not pd.isna(dob_dt):
         age = (pd.Timestamp.now().normalize() - dob_dt.normalize()).days / 365.25
 
-    # Record "W-L-D"
     w = l = d = np.nan
     mrec = re.search(r'(\d+)\s*-\s*(\d+)\s*-\s*(\d+)', record)
     if mrec:
         w, l, d = int(mrec.group(1)), int(mrec.group(2)), int(mrec.group(3))
 
-    out = {
+    return {
         "Name": name,
         "Record": record,
         "W": w, "L": l, "D": d,
@@ -1036,12 +1017,8 @@ def _extract_fighter_profile(html: str):
         "TDDef": stats.get("TDDef", np.nan),
         "SubAvg": stats.get("SubAvg", np.nan),
     }
-    return out
 
 def _coerce_profile(p: dict) -> dict:
-    """
-    Convert numeric fields that may be strings/percent.
-    """
     def to_num(x):
         if x is None:
             return np.nan
@@ -1072,19 +1049,9 @@ def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 def ufc_predict_fight(red: dict, blue: dict):
-    """
-    Heuristic model using requested inputs:
-    age, reach, stance, record, rank (N/A), last five (N/A), td def/acc, td avg, striking.
-    inside distance + decision cannot be reliably scraped without deep fight history;
-    so we approximate finishing vs decision propensity using:
-      - SubAvg, TDAvg, Striking volume & defense
-      - record win rate proxy (W/(W+L))
-    Output: pick and probability.
-    """
     r = _coerce_profile(dict(red))
     b = _coerce_profile(dict(blue))
 
-    # win rate proxy
     def win_rate(p):
         w, l = p.get("W"), p.get("L")
         if pd.isna(w) or pd.isna(l) or (w + l) <= 0:
@@ -1094,7 +1061,6 @@ def ufc_predict_fight(red: dict, blue: dict):
     r_wr = win_rate(r)
     b_wr = win_rate(b)
 
-    # stance edge small bump if southpaw vs orthodox (just a tiny generic)
     stance_edge = 0.0
     if isinstance(r.get("Stance"), str) and isinstance(b.get("Stance"), str):
         rs = r["Stance"].lower()
@@ -1104,40 +1070,20 @@ def ufc_predict_fight(red: dict, blue: dict):
         elif ("orthodox" in rs) and ("southpaw" in bs):
             stance_edge = -0.03
 
-    # Feature deltas (red - blue)
-    d_reach = (r.get("ReachIn", np.nan) - b.get("ReachIn", np.nan))
-    d_age = (r.get("Age", np.nan) - b.get("Age", np.nan))
-    d_slpm = (r.get("SLpM", np.nan) - b.get("SLpM", np.nan))
-    d_sapm = (r.get("SApM", np.nan) - b.get("SApM", np.nan))
-    d_stracc = (r.get("StrAcc", np.nan) - b.get("StrAcc", np.nan))
-    d_strdef = (r.get("StrDef", np.nan) - b.get("StrDef", np.nan))
-    d_tdavg = (r.get("TDAvg", np.nan) - b.get("TDAvg", np.nan))
-    d_tdacc = (r.get("TDAcc", np.nan) - b.get("TDAcc", np.nan))
-    d_tddef = (r.get("TDDef", np.nan) - b.get("TDDef", np.nan))
-    d_subavg = (r.get("SubAvg", np.nan) - b.get("SubAvg", np.nan))
-    d_wr = r_wr - b_wr
-
-    # Replace NaNs with 0 (neutral)
     def nz(x): return 0.0 if pd.isna(x) else float(x)
-    d_reach = nz(d_reach)
-    d_age = nz(d_age)
-    d_slpm = nz(d_slpm)
-    d_sapm = nz(d_sapm)
-    d_stracc = nz(d_stracc)
-    d_strdef = nz(d_strdef)
-    d_tdavg = nz(d_tdavg)
-    d_tdacc = nz(d_tdacc)
-    d_tddef = nz(d_tddef)
-    d_subavg = nz(d_subavg)
-    d_wr = nz(d_wr)
 
-    # Heuristic scoring (tuned to be stable, not extreme)
-    # - reach helps a bit
-    # - younger (slightly) helps (penalize being older)
-    # - higher SLpM and lower SApM helps
-    # - better acc/def helps
-    # - wrestling: tdavg/acc + defense
-    # - subs: subavg small bump
+    d_reach = nz((r.get("ReachIn", np.nan) - b.get("ReachIn", np.nan)))
+    d_age = nz((r.get("Age", np.nan) - b.get("Age", np.nan)))
+    d_slpm = nz((r.get("SLpM", np.nan) - b.get("SLpM", np.nan)))
+    d_sapm = nz((r.get("SApM", np.nan) - b.get("SApM", np.nan)))
+    d_stracc = nz((r.get("StrAcc", np.nan) - b.get("StrAcc", np.nan)))
+    d_strdef = nz((r.get("StrDef", np.nan) - b.get("StrDef", np.nan)))
+    d_tdavg = nz((r.get("TDAvg", np.nan) - b.get("TDAvg", np.nan)))
+    d_tdacc = nz((r.get("TDAcc", np.nan) - b.get("TDAcc", np.nan)))
+    d_tddef = nz((r.get("TDDef", np.nan) - b.get("TDDef", np.nan)))
+    d_subavg = nz((r.get("SubAvg", np.nan) - b.get("SubAvg", np.nan)))
+    d_wr = nz(r_wr - b_wr)
+
     score = (
         0.06 * (d_reach / 5.0) +
         -0.07 * (d_age / 5.0) +
@@ -1154,15 +1100,16 @@ def ufc_predict_fight(red: dict, blue: dict):
     )
 
     p_red = float(_sigmoid(score))
-    pick = r.get("Name") or "Red"
-    opp = b.get("Name") or "Blue"
+    red_name = r.get("Name") or "Red"
+    blue_name = b.get("Name") or "Blue"
+
     if p_red < 0.5:
-        pick = opp
+        pick = blue_name
         p = 1.0 - p_red
     else:
+        pick = red_name
         p = p_red
 
-    # decision vs inside-distance heuristic: higher offensive activity (SLpM, TDAvg, SubAvg) -> more likely finish
     finish_score = (
         0.35 * (nz(r.get("SLpM")) + nz(b.get("SLpM"))) / 10.0 +
         0.35 * (nz(r.get("TDAvg")) + nz(b.get("TDAvg"))) / 8.0 +
@@ -1173,65 +1120,88 @@ def ufc_predict_fight(red: dict, blue: dict):
 
     return {
         "Pick": pick,
-        "Prob": float(np.clip(p, 0.52, 0.80)),  # keep reasonable
+        "Prob": float(np.clip(p, 0.52, 0.80)),
         "Finish%": round(p_finish * 100.0, 1),
         "Decision%": round(p_dec * 100.0, 1),
         "Score": float(score),
+        "Red": red_name,
+        "Blue": blue_name,
     }
+
+@st.cache_data(ttl=60 * 30)
+def ufc_get_event_card(event_url: str):
+    ev_html = ufc_fetch_html(event_url)
+    fights = _extract_fight_rows(ev_html)
+    return fights
+
+@st.cache_data(ttl=60 * 60)
+def ufc_get_fighter_profile(fighter_url: str):
+    html = ufc_fetch_html(fighter_url)
+    prof = _extract_fighter_profile(html)
+    return prof
 
 def render_ufc():
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.subheader("🥊 UFC — Fight Picks (No lxml, no CSV)")
-    st.caption("Uses UFCStats (upcoming first). Model uses age/reach/stance/record + striking + takedowns. Finish/Decision is a heuristic proxy.")
+    st.subheader("🥊 UFC — Fight Picks (UFCStats)")
+    st.caption("UFCStats upcoming-first. Model uses age/reach/stance/record + striking + takedowns. Finish/Decision is heuristic.")
 
-    try:
-        events = ufc_list_events(limit=25)
-    except Exception as e:
-        st.error(f"Could not load UFC events: {e}")
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
-
+    events = ufc_list_events(limit=40)
     if events.empty:
-        st.warning("No UFC events found (upcoming + completed returned nothing). If this persists, UFCStats may have changed HTML.")
+        st.warning("No UFC events found from UFCStats (upcoming/completed).")
         if debug:
-            st.json({"hint": "Check http://ufcstats.com/statistics/events/upcoming?page=all in your browser"})
+            st.json({
+                "try_in_browser": [
+                    UFC_BASE_HTTPS + "/statistics/events/upcoming?page=all",
+                    UFC_BASE_HTTP + "/statistics/events/upcoming?page=all",
+                    UFC_BASE_HTTPS + "/statistics/events/completed?page=all",
+                ],
+                "note": "If these load in browser but not in the app host, outbound access may be restricted."
+            })
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    # Pick event (show DateStr + Event)
-    opts = (events["DateStr"].astype(str) + " — " + events["Event"].astype(str)).tolist()
+    # Prefer upcoming (closest future) if dates exist
+    if events["Date"].notna().any():
+        now = pd.Timestamp.now(tz=None)
+        future = events[events["Date"] >= now.normalize()].copy()
+        if not future.empty:
+            future = future.sort_values("Date", ascending=True)
+            pick_df = pd.concat([future, events[~events.index.isin(future.index)]], ignore_index=True)
+            events = pick_df.drop_duplicates(subset=["EventURL"], keep="first")
+
+    opts = (events["DateStr"].fillna("").astype(str) + " — " + events["Event"].astype(str)).tolist()
+    # Default to first row (likely closest upcoming)
     sel = st.selectbox("Select UFC Event", opts, index=0, key="ufc_event_select")
     sel_idx = opts.index(sel)
     ev_url = events.loc[sel_idx, "EventURL"]
-    st.markdown(f"<span class='pill'>Source: UFCStats</span> <span class='pill'>Event Page Loaded</span>", unsafe_allow_html=True)
 
-    # Load fights
+    if debug:
+        st.json({"selected_event_url": ev_url})
+
     try:
-        ev_html = ufc_fetch_html(ev_url)
-        fights = _extract_fight_rows(ev_html)
+        fights = ufc_get_event_card(ev_url)
     except Exception as e:
         st.error(f"Could not load event card: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
     if not fights:
-        st.warning("No fights parsed on this event page. UFCStats HTML may have changed.")
+        st.warning("No fights parsed on this event page (HTML changed or blocked).")
         if debug:
             st.json({"event_url": ev_url})
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    # For each fight, pull fighter profiles and predict
     rows = []
+    failures = 0
     for f in fights:
         try:
-            r_html = ufc_fetch_html(f["RedURL"])
-            b_html = ufc_fetch_html(f["BlueURL"])
-            r_prof = _extract_fighter_profile(r_html)
-            b_prof = _extract_fighter_profile(b_html)
+            r_prof = ufc_get_fighter_profile(f["RedURL"])
+            b_prof = ufc_get_fighter_profile(f["BlueURL"])
             pred = ufc_predict_fight(r_prof, b_prof)
+
             rows.append({
-                "Fight": f"{r_prof.get('Name') or f['Red']} vs {b_prof.get('Name') or f['Blue']}",
+                "Fight": f"{pred['Red']} vs {pred['Blue']}",
                 "Pick": pred["Pick"],
                 "WinProb%": round(pred["Prob"] * 100.0, 1),
                 "Finish%": pred["Finish%"],
@@ -1246,18 +1216,21 @@ def render_ufc():
                 "Blue_Record": b_prof.get("Record", ""),
             })
         except Exception:
-            # swallow per-fight failures, keep app stable
-            continue
-
-        time.sleep(0.05)  # be polite
+            failures += 1
+        time.sleep(0.03)
 
     if not rows:
-        st.warning("Could not compute predictions (fighter pages may be blocked or HTML changed).")
+        st.warning("Could not compute predictions (all fighter pages failed).")
+        if debug:
+            st.json({"fights_found": len(fights), "fighter_page_failures": failures})
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
     df = pd.DataFrame(rows).sort_values("WinProb%", ascending=False).reset_index(drop=True)
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+    if debug and failures:
+        st.info(f"Skipped {failures} fight(s) due to fetch/parse failures.")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1516,7 +1489,6 @@ else:
                 })
             tracker_log_rows(rows)
             st.success("Logged PGA picks to Tracker ✅")
-
     else:
         st.warning(err.get("error", "No PGA data available right now."))
         if debug:

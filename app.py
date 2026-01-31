@@ -1,6 +1,8 @@
 import os
 import time
 from datetime import datetime
+from io import StringIO
+
 import requests
 import numpy as np
 import pandas as pd
@@ -46,13 +48,13 @@ div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
   canvas, svg, img { max-width: 100% !important; height: auto !important; }
 
   /* radio buttons: bigger tap targets */
-  div[role="radiogroup"] label { 
-    padding: 10px 10px !important; 
+  div[role="radiogroup"] label {
+    padding: 10px 10px !important;
     margin: 6px 0 !important;
     border-radius: 12px !important;
   }
-  div[role="radiogroup"] label p { 
-    font-size: 1.05rem !important; 
+  div[role="radiogroup"] label p {
+    font-size: 1.05rem !important;
     font-weight: 700 !important;
   }
 }
@@ -198,246 +200,6 @@ def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 # =========================================================
-# ESPN Auto-Grading (Tracker only - does not change bet logic)
-# =========================================================
-ESPN_HOST = "https://site.api.espn.com/apis/site/v2/sports"
-
-ESPN_SPORT_PATHS = {
-    "NFL": "football/nfl",
-    "CFB": "football/college-football",
-    "CBB": "basketball/mens-college-basketball",
-}
-
-def _norm_team(s: str) -> str:
-    if not isinstance(s, str):
-        return ""
-    s = s.strip().lower()
-    for ch in [".", ",", "'", "\""]:
-        s = s.replace(ch, "")
-    s = " ".join(s.split())
-    s = s.replace("st ", "saint ")
-    s = s.replace("st.", "saint ")
-    return s
-
-def _parse_matchup(event_str: str):
-    if not isinstance(event_str, str) or "@" not in event_str:
-        return None, None
-    away, home = event_str.split("@", 1)
-    return away.strip(), home.strip()
-
-def _is_final(espn_event: dict) -> bool:
-    try:
-        comp = (espn_event.get("competitions") or [])[0]
-        status = (comp.get("status") or {}).get("type") or {}
-        if status.get("completed") is True:
-            return True
-        if str(status.get("state", "")).lower() in ["post", "postponed", "canceled", "final"]:
-            return True
-        desc = str(status.get("description", "")).lower()
-        if "final" in desc:
-            return True
-    except Exception:
-        pass
-    return False
-
-def _extract_scores(espn_event: dict):
-    try:
-        comp = (espn_event.get("competitions") or [])[0]
-        comps = comp.get("competitors") or []
-        home = next((c for c in comps if c.get("homeAway") == "home"), None)
-        away = next((c for c in comps if c.get("homeAway") == "away"), None)
-        if not home or not away:
-            return None
-
-        def team_name(c):
-            t = c.get("team") or {}
-            return (t.get("displayName") or t.get("name") or t.get("shortDisplayName") or "").strip()
-
-        def team_score(c):
-            sc = c.get("score")
-            try:
-                return float(sc)
-            except Exception:
-                return None
-
-        hn = team_name(home)
-        an = team_name(away)
-        hs = team_score(home)
-        a_s = team_score(away)
-        if not hn or not an or hs is None or a_s is None:
-            return None
-
-        return {"away_name": an, "home_name": hn, "away_score": a_s, "home_score": hs}
-    except Exception:
-        return None
-
-@st.cache_data(ttl=60 * 10)
-def fetch_espn_scoreboard(sport_label: str, date_yyyymmdd: str):
-    sp = ESPN_SPORT_PATHS.get(sport_label)
-    if not sp:
-        return {"ok": False, "status": 0, "payload": {"error": f"ESPN sport mapping missing for {sport_label}"}}
-
-    url = f"{ESPN_HOST}/{sp}/scoreboard"
-    params = {"dates": date_yyyymmdd}
-    ok, status, payload, final_url = safe_get(url, params=params, timeout=25)
-    return {"ok": ok, "status": status, "payload": payload, "url": final_url, "params": params}
-
-def build_espn_match_index(payload: dict):
-    idx = {}
-    if not isinstance(payload, dict):
-        return idx
-    events = payload.get("events")
-    if not isinstance(events, list):
-        return idx
-
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        sc = _extract_scores(ev)
-        if not sc:
-            continue
-        final = _is_final(ev)
-        k = (_norm_team(sc["away_name"]), _norm_team(sc["home_name"]))
-        idx[k] = {
-            "final": final,
-            "away_score": sc["away_score"],
-            "home_score": sc["home_score"],
-            "away_name": sc["away_name"],
-            "home_name": sc["home_name"],
-        }
-    return idx
-
-def _grade_game_line_row(row: pd.Series, espn_idx: dict):
-    try:
-        if str(row.get("Mode", "")) != "Game Lines":
-            return None, None
-
-        sport = str(row.get("Sport", "")).strip()
-        market = str(row.get("Market", "")).strip()  # Moneyline / Spreads / Totals
-        event = str(row.get("Event", "")).strip()
-        selection = str(row.get("Selection", "")).strip()
-        line_raw = row.get("Line", "")
-
-        away, home = _parse_matchup(event)
-        if not away or not home:
-            return None, None
-
-        key = (_norm_team(away), _norm_team(home))
-        g = espn_idx.get(key)
-        if not g or not g.get("final"):
-            return None, None
-
-        a = float(g["away_score"])
-        h = float(g["home_score"])
-        total = a + h
-
-        if market == "Moneyline":
-            sel = _norm_team(selection)
-            if sel == _norm_team(g["away_name"]):
-                return "Graded", ("W" if a > h else ("P" if a == h else "L"))
-            if sel == _norm_team(g["home_name"]):
-                return "Graded", ("W" if h > a else ("P" if a == h else "L"))
-            return None, None
-
-        if market == "Spreads":
-            try:
-                spread = float(line_raw)
-            except Exception:
-                return None, None
-
-            sel = _norm_team(selection)
-            if sel == _norm_team(g["away_name"]):
-                adj = a + spread
-                if adj > h: return "Graded", "W"
-                if adj < h: return "Graded", "L"
-                return "Graded", "P"
-            if sel == _norm_team(g["home_name"]):
-                adj = h + spread
-                if adj > a: return "Graded", "W"
-                if adj < a: return "Graded", "L"
-                return "Graded", "P"
-            return None, None
-
-        if market == "Totals":
-            try:
-                tline = float(line_raw)
-            except Exception:
-                return None, None
-            sel = selection.strip().lower()
-            if sel == "over":
-                if total > tline: return "Graded", "W"
-                if total < tline: return "Graded", "L"
-                return "Graded", "P"
-            if sel == "under":
-                if total < tline: return "Graded", "W"
-                if total > tline: return "Graded", "L"
-                return "Graded", "P"
-            return None, None
-
-        return None, None
-    except Exception:
-        return None, None
-
-def auto_grade_tracker_from_espn(df: pd.DataFrame, debug_log: bool = False):
-    if df.empty:
-        return df, {"graded": 0, "checked": 0, "notes": ["Tracker empty."]}
-
-    d = df.copy()
-    d["Status"] = d["Status"].fillna("Pending")
-    d["Result"] = d["Result"].fillna("")
-
-    mask = (
-        (d["Mode"] == "Game Lines") &
-        (d["Status"].astype(str) != "Graded") &
-        (d["Sport"].isin(list(ESPN_SPORT_PATHS.keys())))
-    )
-    candidates = d[mask].copy()
-    if candidates.empty:
-        return d, {"graded": 0, "checked": 0, "notes": ["No eligible ungraded Game Lines rows found."]}
-
-    candidates["LoggedAt_dt"] = pd.to_datetime(candidates["LoggedAt"], errors="coerce")
-    candidates = candidates.dropna(subset=["LoggedAt_dt"])
-    if candidates.empty:
-        return d, {"graded": 0, "checked": 0, "notes": ["No parseable LoggedAt timestamps for eligible rows."]}
-
-    graded_count = 0
-    checked_count = 0
-    notes = []
-    cache_idx = {}
-
-    def get_idx_for(sport, date_dt):
-        for offset in [0, -1, 1]:
-            dd = (date_dt + pd.Timedelta(days=offset)).strftime("%Y%m%d")
-            k = (sport, dd)
-            if k not in cache_idx:
-                res = fetch_espn_scoreboard(sport, dd)
-                if res.get("ok"):
-                    cache_idx[k] = build_espn_match_index(res["payload"])
-                else:
-                    cache_idx[k] = {}
-            if cache_idx[k]:
-                return cache_idx[k]
-        return {}
-
-    for idx_row, row in candidates.iterrows():
-        sport = str(row.get("Sport", "")).strip()
-        date_dt = row["LoggedAt_dt"].normalize()
-
-        espn_idx = get_idx_for(sport, date_dt)
-        checked_count += 1
-
-        new_status, new_result = _grade_game_line_row(row, espn_idx)
-        if new_status and new_result:
-            d.at[idx_row, "Status"] = new_status
-            d.at[idx_row, "Result"] = new_result
-            graded_count += 1
-
-    if debug_log:
-        notes.append(f"Checked {checked_count} eligible rows; graded {graded_count} rows (Final games only).")
-
-    return d, {"graded": graded_count, "checked": checked_count, "notes": notes}
-
-# =========================================================
 # Odds math
 # =========================================================
 def american_to_implied(odds) -> float:
@@ -504,7 +266,8 @@ st.sidebar.markdown("---")
 debug = st.sidebar.checkbox("Show debug logs", value=False)
 show_non_value = st.sidebar.checkbox("Show non-value rows (Edge ≤ 0)", value=False)
 
-mode = st.sidebar.radio("Mode", ["Game Lines", "Player Props", "PGA", "Tracker"], index=0)
+# ✅ NEW: UFC Picks added to radio options
+mode = st.sidebar.radio("Mode", ["Game Lines", "Player Props", "PGA", "UFC Picks", "Tracker"], index=0)
 
 with st.sidebar.expander("API Keys (session-only override)", expanded=False):
     st.caption("If Secrets aren’t set, paste keys here (session-only).")
@@ -528,10 +291,10 @@ st.markdown("<div class='big-title'>EdgeLedger</div>", unsafe_allow_html=True)
 st.caption(
     "Ranked by **Edge = YourProb − ImpliedProb(best price)**. "
     "**Strict contradiction removal**: only one side per game/market (and one side per player/market). "
-    "DK/FD only. Game lines / props / PGA run independently."
+    "DK/FD only. Game lines / props / PGA run independently. UFC runs independently."
 )
 
-if not ODDS_API_KEY.strip() and mode != "Tracker":
+if not ODDS_API_KEY.strip() and mode not in ["Tracker", "UFC Picks"]:
     st.error('Missing ODDS_API_KEY. Add it in Streamlit Secrets as ODDS_API_KEY="..." or paste it in the sidebar expander.')
     st.stop()
 
@@ -624,7 +387,7 @@ def normalize_props(event_payload):
             mkey = mk.get("key")
             for out in (mk.get("outcomes", []) or []):
                 player = out.get("name")
-                side = out.get("description")
+                side = out.get("description")  # Over/Under usually; may be blank
                 line = out.get("point")
                 price = out.get("price")
 
@@ -666,6 +429,11 @@ def compute_no_vig_within_book_two_way(df: pd.DataFrame, group_cols_book: list) 
     return out
 
 def estimate_your_prob(df: pd.DataFrame, key_cols: list, book_cols: list) -> pd.DataFrame:
+    """
+    YourProb:
+    - two-way: no-vig within each book, avg across books
+    - one-way: market-consensus avg implied across books (enables value by shopping)
+    """
     if df.empty:
         return df.copy()
 
@@ -704,6 +472,10 @@ def best_price_and_edge(df: pd.DataFrame, group_cols_best: list) -> pd.DataFrame
     return best
 
 def strict_no_contradictions(df_best: pd.DataFrame, contradiction_cols: list) -> pd.DataFrame:
+    """
+    STRICT contradiction removal:
+    Keep exactly ONE row per contradiction group (max Edge), ignoring line differences.
+    """
     if df_best.empty:
         return df_best
     out = df_best.copy()
@@ -870,22 +642,13 @@ def _dg_find_rows(payload):
             if len(rows) == 0 or isinstance(rows[0], dict):
                 return rows, meta
 
-    model_keys = []
-    if "models_available" in payload and isinstance(payload["models_available"], list):
-        model_keys = [m for m in payload["models_available"] if isinstance(m, str)]
-
     prefer = ["baseline_history_fit", "baseline", "sg_total", "default"]
-    model_choice = None
     for p in prefer:
         if p in payload and isinstance(payload[p], list):
-            model_choice = p
-            break
-
-    if model_choice and isinstance(payload.get(model_choice), list):
-        rows = payload[model_choice]
-        if len(rows) == 0 or isinstance(rows[0], dict):
-            meta["model_used"] = model_choice
-            return rows, meta
+            rows = payload[p]
+            if len(rows) == 0 or isinstance(rows[0], dict):
+                meta["model_used"] = p
+                return rows, meta
 
     for k, v in payload.items():
         if isinstance(v, list) and (len(v) == 0 or isinstance(v[0], dict)):
@@ -1078,7 +841,475 @@ def build_pga_board():
     return {"winners": winners, "top10s": top10s, "oad": oad, "meta": meta}, {}
 
 # =========================================================
-# Tracker Page UI (UPDATED with ESPN auto-grade)
+# UFC Picks — Feature model + style + pace/durability proxies (isolated)
+# =========================================================
+
+UFC_DEFAULT_CSV = """Card,WeightClass,FighterA,FighterB,AgeA,AgeB,ReachA,ReachB,StanceA,StanceB,StyleA,StyleB,WinsA,LossesA,WinsB,LossesB,Last5A,Last5B,RankA,RankB,TDD_A,TDD_B,TDA_A,TDA_B,ITD_A,ITD_B,DEC_A,DEC_B,SLpM_A,SLpM_B,SApM_A,SApM_B,KD15_A,KD15_B,SubAvg_A,SubAvg_B,StrDef_A,StrDef_B
+UFC Card,Bantamweight,Example A,Example B,29,33,70,72,Orthodox,Southpaw,Striker,Wrestler,16,4,13,6,4-1,2-3,10,15,72,65,38,29,58,44,42,49,4.8,3.6,3.1,3.8,0.55,0.30,0.20,0.70,58,52
+"""
+
+UFC_NUM_COLS = [
+    "AgeA","AgeB","ReachA","ReachB","WinsA","LossesA","WinsB","LossesB",
+    "RankA","RankB","TDD_A","TDD_B","TDA_A","TDA_B","ITD_A","ITD_B","DEC_A","DEC_B",
+    "SLpM_A","SLpM_B","SApM_A","SApM_B","KD15_A","KD15_B","SubAvg_A","SubAvg_B","StrDef_A","StrDef_B"
+]
+
+def _safe_float(x):
+    try:
+        if pd.isna(x):
+            return np.nan
+        return float(str(x).strip().replace("%",""))
+    except Exception:
+        return np.nan
+
+def _parse_last5(s):
+    if not isinstance(s, str):
+        return (np.nan, np.nan)
+    t = s.strip().upper()
+    if not t:
+        return (np.nan, np.nan)
+    if "-" in t:
+        parts = t.split("-")
+        if len(parts) == 2:
+            return (_safe_float(parts[0]), _safe_float(parts[1]))
+    w = t.count("W")
+    l = t.count("L")
+    if w + l > 0:
+        return (float(w), float(l))
+    return (np.nan, np.nan)
+
+def _stance_score(stance_a, stance_b):
+    a = (stance_a or "").strip().lower()
+    b = (stance_b or "").strip().lower()
+    score = 0.0
+    if "switch" in a:
+        score += 0.08
+    if "switch" in b:
+        score -= 0.08
+    if ("south" in a) and ("ortho" in b):
+        score += 0.06
+    if ("ortho" in a) and ("south" in b):
+        score -= 0.06
+    return score
+
+def _style_to_vec(style: str):
+    """
+    Returns (strike_bias, grap_bias, finish_bias) in [-1..1] rough heuristics.
+    """
+    s = (style or "").strip().lower()
+    strike = 0.0
+    grap = 0.0
+    finish = 0.0
+    if "strik" in s:
+        strike += 0.7
+        finish += 0.25
+    if "wrest" in s:
+        grap += 0.8
+        finish -= 0.05   # control can lead to decisions
+    if "bjj" in s or "jiu" in s:
+        grap += 0.6
+        finish += 0.20
+    if "box" in s or "kick" in s or "muay" in s:
+        strike += 0.8
+        finish += 0.20
+    if "mix" in s or "well" in s or "all" in s:
+        strike += 0.3
+        grap += 0.3
+        finish += 0.10
+    # clip to [-1,1]
+    strike = float(np.clip(strike, -1, 1))
+    grap = float(np.clip(grap, -1, 1))
+    finish = float(np.clip(finish, -1, 1))
+    return strike, grap, finish
+
+def _norm_rank(r):
+    if pd.isna(r):
+        return 35.0
+    r = float(r)
+    if r <= 0:
+        return 35.0
+    return r
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+def _clip01(x):
+    return float(np.clip(x, 0.001, 0.999))
+
+def _implied_from_prob(p):
+    p = _clip01(p)
+    if p >= 0.5:
+        return int(round(-100 * p / (1 - p)))
+    return int(round(100 * (1 - p) / p))
+
+def _compute_ufc_probs(row):
+    # Core
+    age_a = _safe_float(row.get("AgeA"))
+    age_b = _safe_float(row.get("AgeB"))
+    reach_a = _safe_float(row.get("ReachA"))
+    reach_b = _safe_float(row.get("ReachB"))
+
+    wins_a = _safe_float(row.get("WinsA"))
+    losses_a = _safe_float(row.get("LossesA"))
+    wins_b = _safe_float(row.get("WinsB"))
+    losses_b = _safe_float(row.get("LossesB"))
+
+    last5a_w, last5a_l = _parse_last5(str(row.get("Last5A","")))
+    last5b_w, last5b_l = _parse_last5(str(row.get("Last5B","")))
+
+    rank_a = _norm_rank(_safe_float(row.get("RankA")))
+    rank_b = _norm_rank(_safe_float(row.get("RankB")))
+
+    tdd_a = _safe_float(row.get("TDD_A"))
+    tdd_b = _safe_float(row.get("TDD_B"))
+    tda_a = _safe_float(row.get("TDA_A"))
+    tda_b = _safe_float(row.get("TDA_B"))
+
+    itd_a = _safe_float(row.get("ITD_A"))
+    itd_b = _safe_float(row.get("ITD_B"))
+    dec_a = _safe_float(row.get("DEC_A"))
+    dec_b = _safe_float(row.get("DEC_B"))
+
+    stance_a = row.get("StanceA","")
+    stance_b = row.get("StanceB","")
+
+    style_a = row.get("StyleA","")
+    style_b = row.get("StyleB","")
+
+    # Pace / durability proxies
+    slpm_a = _safe_float(row.get("SLpM_A"))
+    slpm_b = _safe_float(row.get("SLpM_B"))
+    sapm_a = _safe_float(row.get("SApM_A"))
+    sapm_b = _safe_float(row.get("SApM_B"))
+    kd15_a = _safe_float(row.get("KD15_A"))
+    kd15_b = _safe_float(row.get("KD15_B"))
+    sub_a = _safe_float(row.get("SubAvg_A"))
+    sub_b = _safe_float(row.get("SubAvg_B"))
+    strdef_a = _safe_float(row.get("StrDef_A"))
+    strdef_b = _safe_float(row.get("StrDef_B"))
+
+    # Derived
+    def winpct(w, l):
+        if np.isnan(w) or np.isnan(l) or (w + l) <= 0:
+            return np.nan
+        return w / (w + l)
+
+    wp_a = winpct(wins_a, losses_a)
+    wp_b = winpct(wins_b, losses_b)
+
+    l5_a = np.nan
+    l5_b = np.nan
+    if not np.isnan(last5a_w) and not np.isnan(last5a_l) and (last5a_w + last5a_l) > 0:
+        l5_a = last5a_w / (last5a_w + last5a_l)
+    if not np.isnan(last5b_w) and not np.isnan(last5b_l) and (last5b_w + last5b_l) > 0:
+        l5_b = last5b_w / (last5b_w + last5b_l)
+
+    # Rank advantage (lower better)
+    rank_adv = (rank_b - rank_a)
+    rank_term = np.clip(rank_adv / 20.0, -1.0, 1.0)
+
+    # Age prime
+    def age_prime_bonus(age):
+        if np.isnan(age):
+            return 0.0
+        if 27 <= age <= 32:
+            return 0.08
+        if 33 <= age <= 35:
+            return 0.02
+        if age < 24:
+            return -0.03
+        if age >= 36:
+            return -0.08
+        return 0.0
+
+    age_term = age_prime_bonus(age_a) - age_prime_bonus(age_b)
+
+    # Reach
+    reach_term = 0.0
+    if not np.isnan(reach_a) and not np.isnan(reach_b):
+        reach_term = np.clip((reach_a - reach_b) / 10.0, -0.20, 0.20)
+
+    # Grappling pressure: TDA/TDD
+    grap_a = 0.0
+    grap_b = 0.0
+    if not np.isnan(tda_a):
+        grap_a += (tda_a - 30.0) / 100.0
+    if not np.isnan(tdd_a):
+        grap_a += (tdd_a - 65.0) / 120.0
+    if not np.isnan(tda_b):
+        grap_b += (tda_b - 30.0) / 100.0
+    if not np.isnan(tdd_b):
+        grap_b += (tdd_b - 65.0) / 120.0
+    grap_term = np.clip(grap_a - grap_b, -0.22, 0.22)
+
+    # Record + momentum
+    rec_term = 0.0
+    if not np.isnan(wp_a) and not np.isnan(wp_b):
+        rec_term = np.clip((wp_a - wp_b), -0.25, 0.25)
+
+    mom_term = 0.0
+    if not np.isnan(l5_a) and not np.isnan(l5_b):
+        mom_term = np.clip((l5_a - l5_b), -0.20, 0.20)
+
+    # Stance micro edge
+    stance_term = _stance_score(stance_a, stance_b)
+
+    # Style interaction (strike/grap/finish biases)
+    sa_str, sa_grap, sa_fin = _style_to_vec(style_a)
+    sb_str, sb_grap, sb_fin = _style_to_vec(style_b)
+    style_term = np.clip((sa_str - sb_str) * 0.10 + (sa_grap - sb_grap) * 0.10, -0.12, 0.12)
+
+    # Pace/efficiency/durability:
+    # striking differential (net volume)
+    strike_diff = 0.0
+    if not np.isnan(slpm_a) and not np.isnan(slpm_b):
+        strike_diff += (slpm_a - slpm_b) / 10.0
+    if not np.isnan(sapm_a) and not np.isnan(sapm_b):
+        strike_diff += (sapm_b - sapm_a) / 10.0  # lower SApM is good
+    strike_term = np.clip(strike_diff, -0.20, 0.20)
+
+    # KD rate (power / danger)
+    kd_term = 0.0
+    if not np.isnan(kd15_a) and not np.isnan(kd15_b):
+        kd_term = np.clip((kd15_a - kd15_b) / 2.0, -0.15, 0.15)
+
+    # Sub attempts rate (grappling threat)
+    sub_term = 0.0
+    if not np.isnan(sub_a) and not np.isnan(sub_b):
+        sub_term = np.clip((sub_a - sub_b) / 3.0, -0.12, 0.12)
+
+    # Striking defense (durability proxy)
+    def_term = 0.0
+    if not np.isnan(strdef_a) and not np.isnan(strdef_b):
+        def_term = np.clip((strdef_a - strdef_b) / 100.0, -0.10, 0.10)
+
+    # Assemble win score (logit)
+    x = (
+        0.80 * rank_term +
+        0.85 * rec_term +
+        0.55 * mom_term +
+        0.55 * grap_term +
+        0.45 * strike_term +
+        0.20 * kd_term +
+        0.18 * sub_term +
+        0.20 * def_term +
+        0.35 * age_term +
+        0.25 * reach_term +
+        0.20 * stance_term +
+        0.35 * style_term
+    )
+
+    p_win_a = _clip01(_sigmoid(x))
+
+    # Finish/decision modeling
+    def pct(xv):
+        if np.isnan(xv):
+            return np.nan
+        return np.clip(xv / 100.0, 0.0, 1.0)
+
+    itdA = pct(itd_a)
+    itdB = pct(itd_b)
+    decA = pct(dec_a)
+    decB = pct(dec_b)
+
+    # Base finish tendency from ITD + KD/sub + pace
+    base_finish = 0.52
+    if not np.isnan(itdA) and not np.isnan(itdB):
+        base_finish = np.clip(0.35 + 0.50 * ((itdA + itdB) / 2.0), 0.25, 0.80)
+
+    # Pace proxy: combined volume increases finish chances
+    pace = 0.0
+    if not np.isnan(slpm_a) and not np.isnan(slpm_b):
+        pace += (slpm_a + slpm_b) / 12.0
+    if not np.isnan(sapm_a) and not np.isnan(sapm_b):
+        pace += (sapm_a + sapm_b) / 14.0
+    pace = float(np.clip(pace, 0.0, 1.2))
+
+    # Finishing tools (KD + subs + style finish bias)
+    fin_tools = 0.0
+    if not np.isnan(kd15_a) and not np.isnan(kd15_b):
+        fin_tools += np.clip((kd15_a + kd15_b) / 3.0, 0.0, 1.0) * 0.10
+    if not np.isnan(sub_a) and not np.isnan(sub_b):
+        fin_tools += np.clip((sub_a + sub_b) / 4.0, 0.0, 1.0) * 0.08
+    fin_tools += np.clip((sa_fin + sb_fin) / 2.0, -0.2, 0.4) * 0.10
+
+    # Defense tends toward decisions (higher StrDef + high TDD)
+    def_dec = 0.0
+    if not np.isnan(strdef_a) and not np.isnan(strdef_b):
+        def_dec += np.clip(((strdef_a + strdef_b) / 2.0 - 50.0) / 100.0, -0.2, 0.2) * 0.10
+    if not np.isnan(tdd_a) and not np.isnan(tdd_b):
+        def_dec += np.clip(((tdd_a + tdd_b) / 2.0 - 60.0) / 100.0, -0.2, 0.2) * 0.08
+
+    dominance = abs(x)
+
+    p_itd_fight = np.clip(
+        base_finish
+        + np.clip(0.10 * dominance, 0.0, 0.12)
+        + 0.08 * pace
+        + fin_tools
+        - def_dec,
+        0.18, 0.88
+    )
+    p_dec_fight = 1.0 - p_itd_fight
+
+    # Allocate ITD/DEC shares to A based on tendencies + KD/sub edges
+    itd_share_a = 0.5
+    if not np.isnan(itdA) and not np.isnan(itdB):
+        itd_share_a = _clip01(0.50 + 0.35 * (itdA - itdB))
+    # add small boost for KD/sub superiority
+    if not np.isnan(kd15_a) and not np.isnan(kd15_b):
+        itd_share_a = _clip01(itd_share_a + 0.10 * np.clip((kd15_a - kd15_b) / 1.5, -1, 1))
+    if not np.isnan(sub_a) and not np.isnan(sub_b):
+        itd_share_a = _clip01(itd_share_a + 0.08 * np.clip((sub_a - sub_b) / 2.0, -1, 1))
+
+    dec_share_a = 0.5
+    if not np.isnan(decA) and not np.isnan(decB):
+        dec_share_a = _clip01(0.50 + 0.35 * (decA - decB))
+    if not np.isnan(strdef_a) and not np.isnan(strdef_b):
+        dec_share_a = _clip01(dec_share_a + 0.08 * np.clip((strdef_a - strdef_b) / 40.0, -1, 1))
+
+    p_itd_a = _clip01(p_itd_fight * itd_share_a * p_win_a)
+    p_dec_a = _clip01(p_dec_fight * dec_share_a * p_win_a)
+
+    return {
+        "p_win_a": p_win_a,
+        "p_win_b": 1.0 - p_win_a,
+        "p_itd_fight": p_itd_fight,
+        "p_dec_fight": p_dec_fight,
+        "p_itd_a": p_itd_a,
+        "p_dec_a": p_dec_a
+    }
+
+def render_ufc_picks():
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.subheader("🥊 UFC Picks — Feature Model + Style + Pace/Durability")
+    st.caption(
+        "Paste fight stats or edit in-table. Outputs Win% + ITD/DEC leans. "
+        "This module is fully isolated from Game Lines / Props / PGA."
+    )
+
+    with st.expander("Input template (CSV)", expanded=False):
+        st.code(UFC_DEFAULT_CSV)
+
+    card_label = st.text_input("Card label", value="UFC Card")
+    input_mode = st.radio("Input method", ["Paste CSV", "Edit Table"], horizontal=True)
+
+    if input_mode == "Paste CSV":
+        txt = st.text_area("Paste CSV rows (include header)", value=UFC_DEFAULT_CSV, height=200)
+        try:
+            df_in = pd.read_csv(StringIO(txt))
+        except Exception:
+            st.error("Could not parse CSV. Make sure the header matches the template.")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
+    else:
+        base = pd.read_csv(StringIO(UFC_DEFAULT_CSV))
+        df_in = st.data_editor(base, num_rows="dynamic", use_container_width=True, key="ufc_editor")
+
+    # Normalize numeric columns
+    for c in UFC_NUM_COLS:
+        if c in df_in.columns:
+            df_in[c] = df_in[c].apply(_safe_float)
+
+    # Validate minimal columns
+    for r in ["FighterA", "FighterB"]:
+        if r not in df_in.columns:
+            st.error(f"Missing required column: {r}")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
+
+    out_rows = []
+    for _, row in df_in.iterrows():
+        a = str(row.get("FighterA", "")).strip()
+        b = str(row.get("FighterB", "")).strip()
+        if not a or not b:
+            continue
+
+        probs = _compute_ufc_probs(row)
+
+        pA = probs["p_win_a"]
+        pITDfight = probs["p_itd_fight"]
+        pDECfight = probs["p_dec_fight"]
+
+        pick = a if pA >= 0.5 else b
+        p_pick = max(pA, 1.0 - pA)
+
+        # Suggest bet type
+        bet_type = "Moneyline"
+        why = []
+        if pITDfight >= 0.60:
+            bet_type = "Inside the Distance (lean)"
+            why.append("High finish environment (ITD%)")
+        if pDECfight >= 0.55:
+            bet_type = "Decision (lean)"
+            why.append("Higher decision environment (DEC%)")
+        # If win probability strong, prefer ML even if finish high
+        if p_pick >= 0.72:
+            bet_type = "Moneyline"
+            why.insert(0, "Strong win edge → ML priority")
+
+        conf = int(round(100 * p_pick))
+        conf_bucket = "Lean"
+        if conf >= 68:
+            conf_bucket = "Solid"
+        if conf >= 75:
+            conf_bucket = "Strong"
+
+        out_rows.append({
+            "Card": row.get("Card", card_label),
+            "WeightClass": row.get("WeightClass", ""),
+            "Fight": f"{a} vs {b}",
+            "Pick": pick,
+            "Win% (Pick)": round(100 * p_pick, 1),
+            "Fair Odds (Pick)": _implied_from_prob(p_pick),
+            "Fight ITD%": round(100 * pITDfight, 1),
+            "Fight DEC%": round(100 * pDECfight, 1),
+            "Confidence": conf_bucket,
+            "Best Bet Type": bet_type,
+            "Why": "; ".join([w for w in why if w]) if why else ""
+        })
+
+    if not out_rows:
+        st.warning("No valid fights found. Fill FighterA and FighterB at minimum.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    df_out = pd.DataFrame(out_rows).sort_values(["Win% (Pick)"], ascending=False)
+
+    st.markdown("### Picks (ranked by confidence)")
+    st.dataframe(df_out, use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("Log UFC picks to Tracker"):
+            rows = []
+            for _, r in df_out.iterrows():
+                rows.append({
+                    "LoggedAt": datetime.now().isoformat(),
+                    "Mode": "UFC",
+                    "Sport": "UFC",
+                    "Market": r.get("Best Bet Type", "Moneyline"),
+                    "Event": r.get("Card", card_label),
+                    "Selection": r.get("Pick", ""),
+                    "Line": "",
+                    "BestBook": "",
+                    "BestPrice": "",
+                    "YourProb": (pd.to_numeric(r.get("Win% (Pick)"), errors="coerce") / 100.0),
+                    "Implied": np.nan,
+                    "Edge": np.nan,
+                    "EV": np.nan,
+                    "Status": "Pending",
+                    "Result": "",
+                })
+            tracker_log_rows(rows)
+            st.success("Logged UFC picks ✅ (grade later in Tracker)")
+    with c2:
+        st.caption("If you add sportsbook odds later, we can compute implied + edge like other tabs.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================================================
+# Tracker Page UI
 # =========================================================
 def render_tracker():
     st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -1086,26 +1317,6 @@ def render_tracker():
     st.caption("Log picks from any section, then grade them (W/L/P/N/A). Summaries auto-calc by window.")
 
     df = _load_tracker()
-
-    st.markdown("### Auto-grade (ESPN) — Game Lines only")
-    st.caption("Auto-grades Moneyline / Spreads / Totals for NFL/CFB/CBB when ESPN marks the game Final. Props + PGA remain manual.")
-
-    colA, colB, colC = st.columns([1, 1, 2])
-    with colA:
-        auto_run = st.toggle("Auto-run on open", value=False, key="trk_autorun")
-    with colB:
-        if st.button("Auto-grade now (ESPN)", key="trk_autograde_btn"):
-            updated, meta = auto_grade_tracker_from_espn(df, debug_log=debug)
-            _save_tracker(updated)
-            df = updated
-            st.success(f"Auto-graded {meta.get('graded', 0)} / checked {meta.get('checked', 0)} eligible rows ✅")
-
-    if auto_run:
-        updated, meta = auto_grade_tracker_from_espn(df, debug_log=False)
-        if meta.get("graded", 0) > 0:
-            _save_tracker(updated)
-            df = updated
-            st.info(f"Auto-graded {meta.get('graded', 0)} rows from ESPN (Final games).")
 
     win_map = _windows(df)
     tables = []
@@ -1123,9 +1334,9 @@ def render_tracker():
             hide_index=True
         )
     else:
-        st.info("No tracked picks yet. Log picks from Game Lines / Props / PGA.")
+        st.info("No tracked picks yet. Log picks from Game Lines / Props / PGA / UFC.")
 
-    st.markdown("### Grade Picks (manual override)")
+    st.markdown("### Grade Picks")
     st.caption("Set Status=Graded and Result=W/L/P/N/A. (Leaving Pending means not counted in hit rate.)")
 
     if df.empty:
@@ -1145,6 +1356,10 @@ def render_tracker():
 # =========================================================
 if mode == "Tracker":
     render_tracker()
+    st.stop()
+
+if mode == "UFC Picks":
+    render_ufc_picks()
     st.stop()
 
 if mode == "Game Lines":

@@ -1,7 +1,13 @@
+# app.py — EdgeLedger (Game Lines / Props / PGA / Tracker) + UFC (ESPN) module
+# ✅ UFC fixes: uses ESPN Scoreboard (upcoming), tries BOTH competition_id + event_id for summary,
+#    plus scoreboard-provided href fallbacks. No lxml, no csv, no impact to other modules.
+
 import os
 import time
-from datetime import datetime, timedelta
 import math
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Any, Tuple
+
 import requests
 import numpy as np
 import pandas as pd
@@ -47,13 +53,13 @@ div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
   canvas, svg, img { max-width: 100% !important; height: auto !important; }
 
   /* radio buttons: bigger tap targets */
-  div[role="radiogroup"] label {
-    padding: 10px 10px !important;
+  div[role="radiogroup"] label { 
+    padding: 10px 10px !important; 
     margin: 6px 0 !important;
     border-radius: 12px !important;
   }
-  div[role="radiogroup"] label p {
-    font-size: 1.05rem !important;
+  div[role="radiogroup"] label p { 
+    font-size: 1.05rem !important; 
     font-weight: 700 !important;
   }
 }
@@ -62,7 +68,7 @@ div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
 st.markdown(CSS, unsafe_allow_html=True)
 
 # =========================================================
-# Tracker
+# Tracker (does not change odds/PGA logic)
 # =========================================================
 TRACK_FILE = "tracker.csv"
 
@@ -143,7 +149,7 @@ def _summary_pick_rate(df: pd.DataFrame, label: str) -> pd.DataFrame:
     agg.insert(0, "Window", label)
     return agg.sort_values(["Picks","HitRate%"], ascending=False)
 
-def tracker_log_rows(rows: list[dict]):
+def tracker_log_rows(rows: List[Dict[str, Any]]):
     df = _load_tracker()
     add = pd.DataFrame(rows)
     for c in TRACK_COLUMNS:
@@ -178,16 +184,11 @@ if not DATAGOLF_API_KEY:
 # HTTP
 # =========================================================
 SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EdgeLedger/1.0",
-    "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-})
+SESSION.headers.update({"User-Agent": "EdgeLedger/1.0 (streamlit)"})
 
-def safe_get(url: str, params: dict | None = None, timeout: int = 25):
+def safe_get(url: str, params: Dict[str, Any], timeout: int = 25):
     try:
-        r = SESSION.get(url, params=params or {}, timeout=timeout)
+        r = SESSION.get(url, params=params, timeout=timeout)
         ok = 200 <= r.status_code < 300
         try:
             payload = r.json()
@@ -270,6 +271,7 @@ st.sidebar.markdown("---")
 debug = st.sidebar.checkbox("Show debug logs", value=False)
 show_non_value = st.sidebar.checkbox("Show non-value rows (Edge ≤ 0)", value=False)
 
+# ✅ Mode includes UFC
 mode = st.sidebar.radio("Mode", ["Game Lines", "Player Props", "PGA", "UFC", "Tracker"], index=0)
 
 with st.sidebar.expander("API Keys (session-only override)", expanded=False):
@@ -390,7 +392,7 @@ def normalize_props(event_payload):
             mkey = mk.get("key")
             for out in (mk.get("outcomes", []) or []):
                 player = out.get("name")
-                side = out.get("description")
+                side = out.get("description")  # Over/Under usually; may be blank
                 line = out.get("point")
                 price = out.get("price")
 
@@ -416,7 +418,7 @@ def normalize_props(event_payload):
     return df.dropna(subset=["Market", "Player", "Price"])
 
 # =========================================================
-# Core Best-Bet Logic
+# Core Best-Bet Logic (Implied vs YourProb)
 # =========================================================
 def add_implied(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -424,14 +426,19 @@ def add_implied(df: pd.DataFrame) -> pd.DataFrame:
     out["Implied"] = clamp01(pd.to_numeric(out["Implied"], errors="coerce").fillna(0.5))
     return out
 
-def compute_no_vig_within_book_two_way(df: pd.DataFrame, group_cols_book: list) -> pd.DataFrame:
+def compute_no_vig_within_book_two_way(df: pd.DataFrame, group_cols_book: List[str]) -> pd.DataFrame:
     out = df.copy()
     out["Implied"] = clamp01(pd.to_numeric(out["Implied"], errors="coerce").fillna(0.5))
     sums = out.groupby(group_cols_book)["Implied"].transform("sum")
     out["NoVigProb"] = np.where(sums > 0, out["Implied"] / sums, np.nan)
     return out
 
-def estimate_your_prob(df: pd.DataFrame, key_cols: list, book_cols: list) -> pd.DataFrame:
+def estimate_your_prob(df: pd.DataFrame, key_cols: List[str], book_cols: List[str]) -> pd.DataFrame:
+    """
+    YourProb:
+    - two-way: no-vig within each book, avg across books
+    - one-way: market-consensus avg implied across books (enables value by shopping)
+    """
     if df.empty:
         return df.copy()
 
@@ -450,7 +457,7 @@ def estimate_your_prob(df: pd.DataFrame, key_cols: list, book_cols: list) -> pd.
     out = out.drop(columns=["_n_sides"], errors="ignore")
     return out
 
-def best_price_and_edge(df: pd.DataFrame, group_cols_best: list) -> pd.DataFrame:
+def best_price_and_edge(df: pd.DataFrame, group_cols_best: List[str]) -> pd.DataFrame:
     if df.empty:
         return df.copy()
 
@@ -469,7 +476,12 @@ def best_price_and_edge(df: pd.DataFrame, group_cols_best: list) -> pd.DataFrame
     best["EV"] = (best["Edge"] * 100.0)
     return best
 
-def strict_no_contradictions(df_best: pd.DataFrame, contradiction_cols: list) -> pd.DataFrame:
+def strict_no_contradictions(df_best: pd.DataFrame, contradiction_cols: List[str]) -> pd.DataFrame:
+    """
+    STRICT contradiction removal:
+    Keep exactly ONE row per contradiction group (max Edge), ignoring line differences.
+    This eliminates contradictions within DK, within FD, and across DK+FD simultaneously.
+    """
     if df_best.empty:
         return df_best
     out = df_best.copy()
@@ -609,7 +621,7 @@ def bar_prob(df, label_col, prob_col_percent, title):
     st.pyplot(fig)
 
 # =========================================================
-# PGA — Advanced DataGolf Module (unchanged)
+# PGA — Advanced DataGolf Module (independent)
 # =========================================================
 DG_HOST = "https://feeds.datagolf.com"
 
@@ -679,8 +691,16 @@ def build_pga_board():
         "file_format": "json",
         "key": DATAGOLF_API_KEY,
     }
-    decomp_params = {"tour": "pga", "file_format": "json", "key": DATAGOLF_API_KEY}
-    skill_params = {"display": "value", "file_format": "json", "key": DATAGOLF_API_KEY}
+    decomp_params = {
+        "tour": "pga",
+        "file_format": "json",
+        "key": DATAGOLF_API_KEY,
+    }
+    skill_params = {
+        "display": "value",
+        "file_format": "json",
+        "key": DATAGOLF_API_KEY,
+    }
 
     pre = _dg_get("/preds/pre-tournament", pre_params)
     dec = _dg_get("/preds/player-decompositions", decomp_params)
@@ -832,7 +852,50 @@ def build_pga_board():
     return {"winners": winners, "top10s": top10s, "oad": oad, "meta": meta}, {}
 
 # =========================================================
-# UFC — ESPN Module (FIXED parsing)
+# Tracker Page UI
+# =========================================================
+def render_tracker():
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.subheader("📈 Tracker — Pick Rate + Hit Rate")
+    st.caption("Log picks from any section, then grade them (W/L/P/N/A). Summaries auto-calc by window.")
+
+    df = _load_tracker()
+
+    win_map = _windows(df)
+    tables = []
+    for label, sub in win_map.items():
+        s = _summary_pick_rate(sub, label)
+        if not s.empty:
+            tables.append(s)
+
+    if tables:
+        summary = pd.concat(tables, ignore_index=True)
+        st.markdown("### Summary (Today / Week / Month / Year)")
+        st.dataframe(
+            summary[["Window","Mode","Picks","Graded","Wins","Losses","Pushes","HitRate%"]],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("No tracked picks yet. Log picks from Game Lines / Props / PGA.")
+
+    st.markdown("### Grade Picks")
+    st.caption("Set Status=Graded and Result=W/L/P/N/A. (Leaving Pending means not counted in hit rate.)")
+
+    if df.empty:
+        st.info("Tracker is empty.")
+    else:
+        df["Status"] = df["Status"].fillna("Pending")
+        df["Result"] = df["Result"].fillna("")
+        edited = st.data_editor(df, use_container_width=True, num_rows="dynamic", key="tracker_editor")
+        if st.button("Save Tracker"):
+            _save_tracker(edited)
+            st.success("Saved.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================================================
+# UFC — ESPN Module (FIXED)
 # =========================================================
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
 ESPN_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/summary"
@@ -847,7 +910,7 @@ def _safe_float(x):
         return np.nan
 
 def _parse_inches(s):
-    if s is None:
+    if s is None or (isinstance(s, float) and np.isnan(s)):
         return np.nan
     txt = str(s).strip()
     if txt.isdigit():
@@ -875,38 +938,104 @@ def _calc_age(dob_iso):
     except Exception:
         return np.nan
 
-@st.cache_data(ttl=60 * 60)
-def fetch_ufc_events_next_days(lookahead_days: int = 14):
+@st.cache_data(ttl=60 * 30)
+def fetch_ufc_events_next_days(lookahead_days: int = 21):
+    """
+    Find the next UFC card within lookahead.
+    Captures scoreboard event_id + competition_id and any href links for fallback.
+    """
     events = []
     checked = []
+
     base = pd.Timestamp.now().date()
+
     for i in range(int(lookahead_days) + 1):
         d = base + timedelta(days=i)
         datestr = d.strftime("%Y%m%d")
+
         ok, status, payload, url = safe_get(ESPN_SCOREBOARD, params={"dates": datestr}, timeout=10)
         checked.append({"dates": datestr, "ok": ok, "status": status})
+
         if not ok or not isinstance(payload, dict):
             continue
+
         evs = payload.get("events", []) or []
         for e in evs:
             if not isinstance(e, dict):
                 continue
-            eid = e.get("id")
+
+            event_id = e.get("id")
             name = e.get("name") or e.get("shortName") or "UFC Event"
             dt = e.get("date") or ""
-            if eid:
-                events.append({"event_id": str(eid), "name": str(name), "date": str(dt)})
+
+            comp_id = ""
+            comps = e.get("competitions")
+            if isinstance(comps, list) and comps:
+                if isinstance(comps[0], dict) and comps[0].get("id"):
+                    comp_id = str(comps[0].get("id"))
+
+            hrefs = []
+            links = e.get("links")
+            if isinstance(links, list):
+                for lk in links:
+                    if isinstance(lk, dict):
+                        href = lk.get("href")
+                        if href:
+                            hrefs.append(str(href))
+
+            if event_id:
+                events.append({
+                    "event_id": str(event_id),
+                    "competition_id": comp_id,
+                    "name": str(name),
+                    "date": str(dt),
+                    "hrefs": hrefs,
+                })
+
         if events:
             break
+
         time.sleep(0.05)
+
     return {"events": events, "checked": checked}
 
-@st.cache_data(ttl=60 * 60)
-def fetch_ufc_event_summary(event_id: str):
-    ok, status, payload, url = safe_get(ESPN_SUMMARY, params={"event": event_id}, timeout=12)
-    return {"ok": ok, "status": status, "payload": payload, "url": url}
+@st.cache_data(ttl=60 * 30)
+def fetch_ufc_event_summary(event_id: str, competition_id: str = "", hrefs: Optional[List[str]] = None):
+    """
+    ESPN UFC summary endpoint may expect competition_id rather than scoreboard event_id.
+    We attempt:
+      1) summary?event=<competition_id>
+      2) summary?event=<event_id>
+      3) any scoreboard href that looks like an ESPN API endpoint
+    """
+    attempts = []
 
-@st.cache_data(ttl=60 * 60 * 24)
+    def _try(u: str, params: Optional[Dict[str, Any]] = None):
+        ok, status, payload, final_url = safe_get(u, params=params or {}, timeout=12)
+        attempts.append({"ok": ok, "status": status, "url": final_url})
+        return ok, status, payload, final_url
+
+    if competition_id:
+        ok, status, payload, final_url = _try(ESPN_SUMMARY, params={"event": competition_id})
+        if ok and isinstance(payload, dict):
+            return {"ok": True, "status": status, "payload": payload, "url": final_url, "attempts": attempts}
+
+    ok, status, payload, final_url = _try(ESPN_SUMMARY, params={"event": event_id})
+    if ok and isinstance(payload, dict):
+        return {"ok": True, "status": status, "payload": payload, "url": final_url, "attempts": attempts}
+
+    hrefs = hrefs or []
+    for h in hrefs:
+        if not isinstance(h, str):
+            continue
+        if ("site.api.espn.com" in h) or ("site.web.api.espn.com" in h):
+            ok2, status2, payload2, final_url2 = _try(h, params={})
+            if ok2 and isinstance(payload2, dict):
+                return {"ok": True, "status": status2, "payload": payload2, "url": final_url2, "attempts": attempts}
+
+    return {"ok": False, "status": status, "payload": payload, "url": final_url, "attempts": attempts}
+
+@st.cache_data(ttl=60 * 60 * 12)
 def fetch_ufc_athlete(athlete_id: str):
     url = ESPN_ATHLETE.format(athlete_id=athlete_id)
     ok, status, payload, final_url = safe_get(url, params={}, timeout=12)
@@ -928,17 +1057,20 @@ def _extract_record(rec_str: str):
     except Exception:
         return (np.nan, np.nan, np.nan, np.nan)
 
-def _get_stat(payload: dict, keys: list[str]):
+def _get_stat(payload: dict, keys: List[str]):
     if not isinstance(payload, dict):
         return np.nan
+
     for k in keys:
         if k in payload:
             return payload.get(k)
+
     bio = payload.get("bio", {})
     if isinstance(bio, dict):
         for k in keys:
             if k in bio:
                 return bio.get(k)
+
     stats = payload.get("statistics")
     if isinstance(stats, list):
         for blk in stats:
@@ -954,6 +1086,7 @@ def _get_stat(payload: dict, keys: list[str]):
                     kk = str(k).lower()
                     if kk in name or kk == abbr:
                         return val
+
     return np.nan
 
 def _athlete_features(ath_payload: dict):
@@ -963,8 +1096,8 @@ def _athlete_features(ath_payload: dict):
 
     reach_raw = _get_stat(ath_payload, ["reach", "reachInches"])
     height_raw = _get_stat(ath_payload, ["height", "heightInches"])
-    reach_in = _parse_inches(reach_raw) if reach_raw is not np.nan else np.nan
-    height_in = _parse_inches(height_raw) if height_raw is not np.nan else np.nan
+    reach_in = _parse_inches(reach_raw)
+    height_in = _parse_inches(height_raw)
 
     stance = _get_stat(ath_payload, ["stance"])
     stance = str(stance) if stance is not None and stance is not np.nan else ""
@@ -1011,7 +1144,8 @@ def _athlete_features(ath_payload: dict):
 
 def _pick_model_row(a: dict, b: dict):
     d = {}
-    for k in ["Age", "ReachIn", "HeightIn", "WinPct", "Rank", "SLpM", "SApM", "StrDef", "StrAcc", "TDAvg", "TDAcc", "TDDef", "ITD", "DecRate"]:
+    for k in ["Age", "ReachIn", "HeightIn", "WinPct", "Rank", "SLpM", "SApM", "StrDef", "StrAcc",
+              "TDAvg", "TDAcc", "TDDef", "ITD", "DecRate"]:
         d[k] = _safe_float(a.get(k)) - _safe_float(b.get(k))
 
     stance_a = (a.get("Stance") or "").lower()
@@ -1079,14 +1213,8 @@ def _pick_model_row(a: dict, b: dict):
 
     return p, fin, float(raw)
 
-# ---- FIXED: recursive fight extraction ----
 def _extract_fights_recursive(obj, fights_out):
-    """
-    Walk any JSON object; collect matchups that look like:
-      node['competitors'] = [ {athlete:{id,...}}, {athlete:{id,...}} ]
-    """
     if isinstance(obj, dict):
-        # detect competitor nodes
         if "competitors" in obj and isinstance(obj["competitors"], list) and len(obj["competitors"]) >= 2:
             comps = obj["competitors"]
             a = comps[0] if isinstance(comps[0], dict) else None
@@ -1098,7 +1226,6 @@ def _extract_fights_recursive(obj, fights_out):
                 b_id = b_ath.get("id") or b_ath.get("uid")
                 a_name = a_ath.get("displayName") or a_ath.get("fullName") or ""
                 b_name = b_ath.get("displayName") or b_ath.get("fullName") or ""
-                # only accept if we have IDs
                 if a_id and b_id:
                     fights_out.append({
                         "fight_name": obj.get("name") or "",
@@ -1108,7 +1235,6 @@ def _extract_fights_recursive(obj, fights_out):
                         "athlete_b_id": str(b_id),
                         "athlete_b_name": str(b_name),
                     })
-        # continue traversal
         for v in obj.values():
             _extract_fights_recursive(v, fights_out)
     elif isinstance(obj, list):
@@ -1119,17 +1245,12 @@ def _parse_fights_from_summary(payload: dict):
     fights = []
     if not isinstance(payload, dict):
         return fights
-
-    # 1) Try common direct keys first
     for key in ["competitions", "events", "event", "header"]:
         if key in payload:
             _extract_fights_recursive(payload[key], fights)
-
-    # 2) Full payload scan as fallback
     if not fights:
         _extract_fights_recursive(payload, fights)
 
-    # de-dup fights by fighter ids (order-independent)
     seen = set()
     uniq = []
     for f in fights:
@@ -1144,18 +1265,27 @@ def _parse_fights_from_summary(payload: dict):
         uniq.append(f)
     return uniq
 
-def build_ufc_picks(event_id: str):
-    summ = fetch_ufc_event_summary(event_id)
+def build_ufc_picks(event_id: str, competition_id: str = "", hrefs: Optional[List[str]] = None):
+    summ = fetch_ufc_event_summary(event_id, competition_id=competition_id, hrefs=hrefs)
+
     if not summ["ok"] or not isinstance(summ["payload"], dict):
-        return pd.DataFrame(), pd.DataFrame(), {"error": "Could not load UFC event summary from ESPN.", "status": summ["status"], "url": summ["url"]}
+        return pd.DataFrame(), pd.DataFrame(), {
+            "error": "Could not load UFC event summary from ESPN.",
+            "status": summ.get("status"),
+            "url": summ.get("url"),
+            "attempts": summ.get("attempts", []),
+            "event_id": event_id,
+            "competition_id": competition_id,
+        }
 
     fights = _parse_fights_from_summary(summ["payload"])
     if not fights:
         return pd.DataFrame(), pd.DataFrame(), {
             "error": "No fights parsed from ESPN event summary (payload structure may have changed).",
-            "status": summ["status"],
-            "url": summ["url"],
-            "payload_keys": list(summ["payload"].keys())[:50]
+            "status": summ.get("status"),
+            "url": summ.get("url"),
+            "attempts": summ.get("attempts", []),
+            "payload_keys": list(summ["payload"].keys())[:60],
         }
 
     fighter_rows = []
@@ -1167,13 +1297,13 @@ def build_ufc_picks(event_id: str):
 
         ra = fetch_ufc_athlete(a_id)
         rb = fetch_ufc_athlete(b_id)
+
         a_payload = ra["payload"] if ra["ok"] and isinstance(ra["payload"], dict) else {}
         b_payload = rb["payload"] if rb["ok"] and isinstance(rb["payload"], dict) else {}
 
         a_feat = _athlete_features(a_payload)
         b_feat = _athlete_features(b_payload)
 
-        # fallback to names from fight row if athlete payload name missing
         if not a_feat.get("Name"):
             a_feat["Name"] = f.get("athlete_a_name", "")
         if not b_feat.get("Name"):
@@ -1200,7 +1330,11 @@ def build_ufc_picks(event_id: str):
 
     fighters_df = pd.DataFrame(fighter_rows)
     if fighters_df.empty:
-        return pd.DataFrame(), pd.DataFrame(), {"error": "Could not load fighter data from ESPN athlete endpoints.", "url": summ["url"]}
+        return pd.DataFrame(), pd.DataFrame(), {
+            "error": "Could not load fighter data from ESPN athlete endpoints.",
+            "summary_url": summ.get("url"),
+            "attempts": summ.get("attempts", []),
+        }
 
     picks = []
     for fight_name, grp in fighters_df.groupby("Fight", dropna=False):
@@ -1218,6 +1352,7 @@ def build_ufc_picks(event_id: str):
         delta_age = _safe_float(a.get("Age")) - _safe_float(b.get("Age"))
         delta_reach = _safe_float(a.get("ReachIn")) - _safe_float(b.get("ReachIn"))
         delta_win = _safe_float(a.get("WinPct")) - _safe_float(b.get("WinPct"))
+
         rank_adv = np.nan
         if not np.isnan(_safe_float(a.get("Rank"))) and not np.isnan(_safe_float(b.get("Rank"))):
             rank_adv = (_safe_float(b.get("Rank")) - _safe_float(a.get("Rank")))
@@ -1236,7 +1371,14 @@ def build_ufc_picks(event_id: str):
         })
 
     fights_df = pd.DataFrame(picks).sort_values(["WinProb%"], ascending=False) if picks else pd.DataFrame()
-    diag = {"summary_url": summ["url"], "n_fights": int(len(fights_df)), "parsed_fights": int(len(fights))}
+    diag = {
+        "summary_url": summ.get("url"),
+        "attempts": summ.get("attempts", []),
+        "n_fights": int(len(fights_df)),
+        "parsed_pairs": int(len(fights)),
+        "event_id": event_id,
+        "competition_id": competition_id,
+    }
     return fights_df, fighters_df, diag
 
 def render_ufc():
@@ -1248,7 +1390,7 @@ def render_ufc():
     )
 
     with st.expander("Controls", expanded=True):
-        lookahead = st.slider("Look ahead days (find next card)", 1, 30, 14, step=1)
+        lookahead = st.slider("Look ahead days (find next card)", 1, 45, 21, step=1)
         topn = st.slider("Show top N strongest picks (by model win prob)", 3, 15, 10, step=1)
 
     ev = fetch_ufc_events_next_days(lookahead_days=int(lookahead))
@@ -1269,11 +1411,17 @@ def render_ufc():
             dt_str = dtt.strftime("%a %b %d, %Y %I:%M %p") if not pd.isna(dtt) else dt
         except Exception:
             dt_str = dt
-        return f"{e.get('name','UFC Event')} — {dt_str}"
+        comp = e.get("competition_id","")
+        tag = f" (comp:{comp})" if comp else ""
+        return f"{e.get('name','UFC Event')} — {dt_str}{tag}"
 
     labels = [_label(e) for e in events]
-    choice = st.selectbox("Select Event", options=list(range(len(events))), format_func=lambda i: labels[i], index=0)
-    event_id = events[int(choice)].get("event_id", "")
+    idx = st.selectbox("Select Event", options=list(range(len(events))), format_func=lambda i: labels[i], index=0)
+    picked = events[int(idx)]
+
+    event_id = picked.get("event_id", "")
+    comp_id = picked.get("competition_id", "")
+    hrefs = picked.get("hrefs", []) or []
 
     if not event_id:
         st.error("Selected event has no event_id from ESPN.")
@@ -1281,12 +1429,11 @@ def render_ufc():
         return
 
     with st.spinner("Loading fight card + fighters from ESPN..."):
-        fights_df, fighters_df, diag = build_ufc_picks(event_id)
+        fights_df, fighters_df, diag = build_ufc_picks(event_id, competition_id=comp_id, hrefs=hrefs)
 
     if fights_df.empty:
-        st.warning("Could not build UFC picks for this event (fight list parsed but model table empty or ESPN summary changed).")
-        # show diagnostics even when not in debug to help you fix quickly
-        st.info("Open debug logs to see payload details, or share the diag JSON below.")
+        st.warning("Could not build UFC picks for this event.")
+        st.info("Diagnostics below show which ESPN endpoints were attempted.")
         st.json(diag)
         st.markdown("</div>", unsafe_allow_html=True)
         return
@@ -1305,49 +1452,6 @@ def render_ufc():
 
     if debug:
         st.json(diag)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# =========================================================
-# Tracker Page UI
-# =========================================================
-def render_tracker():
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.subheader("📈 Tracker — Pick Rate + Hit Rate")
-    st.caption("Log picks from any section, then grade them (W/L/P/N/A). Summaries auto-calc by window.")
-
-    df = _load_tracker()
-
-    win_map = _windows(df)
-    tables = []
-    for label, sub in win_map.items():
-        s = _summary_pick_rate(sub, label)
-        if not s.empty:
-            tables.append(s)
-
-    if tables:
-        summary = pd.concat(tables, ignore_index=True)
-        st.markdown("### Summary (Today / Week / Month / Year)")
-        st.dataframe(
-            summary[["Window","Mode","Picks","Graded","Wins","Losses","Pushes","HitRate%"]],
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.info("No tracked picks yet. Log picks from Game Lines / Props / PGA.")
-
-    st.markdown("### Grade Picks")
-    st.caption("Set Status=Graded and Result=W/L/P/N/A. (Leaving Pending means not counted in hit rate.)")
-
-    if df.empty:
-        st.info("Tracker is empty.")
-    else:
-        df["Status"] = df["Status"].fillna("Pending")
-        df["Result"] = df["Result"].fillna("")
-        edited = st.data_editor(df, use_container_width=True, num_rows="dynamic", key="tracker_editor")
-        if st.button("Save Tracker"):
-            _save_tracker(edited)
-            st.success("Saved.")
 
     st.markdown("</div>", unsafe_allow_html=True)
 

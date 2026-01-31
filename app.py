@@ -1,6 +1,6 @@
 import os
 import time
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 import math
 import requests
 import numpy as np
@@ -62,7 +62,7 @@ div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
 st.markdown(CSS, unsafe_allow_html=True)
 
 # =========================================================
-# Tracker (does not change odds/PGA logic)
+# Tracker
 # =========================================================
 TRACK_FILE = "tracker.csv"
 
@@ -270,7 +270,6 @@ st.sidebar.markdown("---")
 debug = st.sidebar.checkbox("Show debug logs", value=False)
 show_non_value = st.sidebar.checkbox("Show non-value rows (Edge ≤ 0)", value=False)
 
-# ✅ Added UFC to radio options (isolated module)
 mode = st.sidebar.radio("Mode", ["Game Lines", "Player Props", "PGA", "UFC", "Tracker"], index=0)
 
 with st.sidebar.expander("API Keys (session-only override)", expanded=False):
@@ -417,7 +416,7 @@ def normalize_props(event_payload):
     return df.dropna(subset=["Market", "Player", "Price"])
 
 # =========================================================
-# Core Best-Bet Logic (Implied vs YourProb)
+# Core Best-Bet Logic
 # =========================================================
 def add_implied(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -610,7 +609,7 @@ def bar_prob(df, label_col, prob_col_percent, title):
     st.pyplot(fig)
 
 # =========================================================
-# PGA — Advanced DataGolf Module (independent)
+# PGA — Advanced DataGolf Module (unchanged)
 # =========================================================
 DG_HOST = "https://feeds.datagolf.com"
 
@@ -833,7 +832,7 @@ def build_pga_board():
     return {"winners": winners, "top10s": top10s, "oad": oad, "meta": meta}, {}
 
 # =========================================================
-# UFC — ESPN API Module (isolated, no csv, no lxml, no UFCStats scraping)
+# UFC — ESPN Module (FIXED parsing)
 # =========================================================
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
 ESPN_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/summary"
@@ -848,13 +847,11 @@ def _safe_float(x):
         return np.nan
 
 def _parse_inches(s):
-    # ESPN sometimes gives "5' 10\"" or "70"
     if s is None:
         return np.nan
     txt = str(s).strip()
     if txt.isdigit():
         return float(txt)
-    # try feet-inches
     try:
         if "'" in txt:
             parts = txt.replace('"','').split("'")
@@ -878,27 +875,16 @@ def _calc_age(dob_iso):
     except Exception:
         return np.nan
 
-def _zscore(series: pd.Series):
-    s = pd.to_numeric(series, errors="coerce")
-    if s.isna().all():
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    mu = np.nanmean(s.values)
-    sd = np.nanstd(s.values)
-    if sd == 0 or np.isnan(sd):
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return (s - mu) / sd
-
-@st.cache_data(ttl=60 * 60)  # 1 hour
+@st.cache_data(ttl=60 * 60)
 def fetch_ufc_events_next_days(lookahead_days: int = 14):
-    """Find upcoming UFC events using ESPN scoreboard. Checks today -> next N days."""
     events = []
     checked = []
     base = pd.Timestamp.now().date()
     for i in range(int(lookahead_days) + 1):
         d = base + timedelta(days=i)
         datestr = d.strftime("%Y%m%d")
-        ok, status, payload, url = safe_get(ESPN_SCOREBOARD, params={"dates": datestr}, timeout=12)
-        checked.append({"dates": datestr, "ok": ok, "status": status, "url": url})
+        ok, status, payload, url = safe_get(ESPN_SCOREBOARD, params={"dates": datestr}, timeout=10)
+        checked.append({"dates": datestr, "ok": ok, "status": status})
         if not ok or not isinstance(payload, dict):
             continue
         evs = payload.get("events", []) or []
@@ -908,25 +894,25 @@ def fetch_ufc_events_next_days(lookahead_days: int = 14):
             eid = e.get("id")
             name = e.get("name") or e.get("shortName") or "UFC Event"
             dt = e.get("date") or ""
-            events.append({"event_id": str(eid) if eid else "", "name": str(name), "date": str(dt)})
+            if eid:
+                events.append({"event_id": str(eid), "name": str(name), "date": str(dt)})
         if events:
-            break  # prefer nearest upcoming day with a card
+            break
         time.sleep(0.05)
     return {"events": events, "checked": checked}
 
-@st.cache_data(ttl=60 * 60)  # 1 hour
+@st.cache_data(ttl=60 * 60)
 def fetch_ufc_event_summary(event_id: str):
-    ok, status, payload, url = safe_get(ESPN_SUMMARY, params={"event": event_id}, timeout=15)
+    ok, status, payload, url = safe_get(ESPN_SUMMARY, params={"event": event_id}, timeout=12)
     return {"ok": ok, "status": status, "payload": payload, "url": url}
 
-@st.cache_data(ttl=60 * 60 * 24)  # 24 hours for fighter bio/stats
+@st.cache_data(ttl=60 * 60 * 24)
 def fetch_ufc_athlete(athlete_id: str):
     url = ESPN_ATHLETE.format(athlete_id=athlete_id)
-    ok, status, payload, final_url = safe_get(url, params={}, timeout=15)
+    ok, status, payload, final_url = safe_get(url, params={}, timeout=12)
     return {"ok": ok, "status": status, "payload": payload, "url": final_url}
 
 def _extract_record(rec_str: str):
-    # e.g. "12-3-0" or "12-3"
     if not isinstance(rec_str, str):
         return (np.nan, np.nan, np.nan, np.nan)
     parts = [p for p in rec_str.replace("(", "").replace(")", "").replace(" ", "").split("-") if p != ""]
@@ -943,23 +929,18 @@ def _extract_record(rec_str: str):
         return (np.nan, np.nan, np.nan, np.nan)
 
 def _get_stat(payload: dict, keys: list[str]):
-    """Try multiple paths for a stat commonly found in ESPN athlete payload."""
     if not isinstance(payload, dict):
         return np.nan
-    # direct keys
     for k in keys:
         if k in payload:
             return payload.get(k)
-    # bio
     bio = payload.get("bio", {})
     if isinstance(bio, dict):
         for k in keys:
             if k in bio:
                 return bio.get(k)
-    # statistics (varies)
     stats = payload.get("statistics")
     if isinstance(stats, list):
-        # ESPN sometimes structures stats by categories; search any key matches
         for blk in stats:
             if not isinstance(blk, dict):
                 continue
@@ -976,47 +957,37 @@ def _get_stat(payload: dict, keys: list[str]):
     return np.nan
 
 def _athlete_features(ath_payload: dict):
-    """Return dict of features we want; robust to missing data."""
-    # name/id
     name = ath_payload.get("displayName") or ath_payload.get("fullName") or ath_payload.get("name") or ""
-    # age
     dob = _get_stat(ath_payload, ["dateOfBirth"])
     age = _calc_age(dob)
 
-    # reach / height
     reach_raw = _get_stat(ath_payload, ["reach", "reachInches"])
     height_raw = _get_stat(ath_payload, ["height", "heightInches"])
     reach_in = _parse_inches(reach_raw) if reach_raw is not np.nan else np.nan
     height_in = _parse_inches(height_raw) if height_raw is not np.nan else np.nan
 
-    # stance
     stance = _get_stat(ath_payload, ["stance"])
     stance = str(stance) if stance is not None and stance is not np.nan else ""
 
-    # record
     record_str = _get_stat(ath_payload, ["record"])
     if isinstance(record_str, dict):
-        # sometimes record has summary
         record_str = record_str.get("summary") or record_str.get("displayValue") or ""
     record_str = str(record_str) if record_str is not None and record_str is not np.nan else ""
     w, l, d, winp = _extract_record(record_str)
 
-    # ranking (if present)
     rank = _safe_float(_get_stat(ath_payload, ["rank", "ranking"]))
 
-    # striking / grappling stats (best-effort)
-    slpm = _safe_float(_get_stat(ath_payload, ["sigStrLandedPerMin", "sig_str_landed_per_min", "slpm"]))
-    sapm = _safe_float(_get_stat(ath_payload, ["sigStrAbsorbedPerMin", "sig_str_absorbed_per_min", "sapm"]))
-    str_def = _safe_float(_get_stat(ath_payload, ["sigStrDefense", "sig_str_defense", "str_def"]))
-    str_acc = _safe_float(_get_stat(ath_payload, ["sigStrAccuracy", "sig_str_accuracy", "str_acc"]))
+    slpm = _safe_float(_get_stat(ath_payload, ["sigStrLandedPerMin", "slpm"]))
+    sapm = _safe_float(_get_stat(ath_payload, ["sigStrAbsorbedPerMin", "sapm"]))
+    str_def = _safe_float(_get_stat(ath_payload, ["sigStrDefense", "str_def"]))
+    str_acc = _safe_float(_get_stat(ath_payload, ["sigStrAccuracy", "str_acc"]))
 
     td_avg = _safe_float(_get_stat(ath_payload, ["takedownsAvg", "takedownAvg", "td_avg"]))
     td_acc = _safe_float(_get_stat(ath_payload, ["takedownAccuracy", "takedownPct", "td_acc"]))
     td_def = _safe_float(_get_stat(ath_payload, ["takedownDefense", "td_def"]))
 
-    # inside distance / decision (or proxies)
     itd = _safe_float(_get_stat(ath_payload, ["insideTheDistance", "itd", "finishRate"]))
-    dec = _safe_float(_get_stat(ath_payload, ["decisionRate", "dec", "decisionPct"]))
+    dec = _safe_float(_get_stat(ath_payload, ["decisionRate", "decisionPct", "dec"]))
 
     return {
         "Name": name,
@@ -1039,37 +1010,22 @@ def _athlete_features(ath_payload: dict):
     }
 
 def _pick_model_row(a: dict, b: dict):
-    """
-    Build a best-effort predictive score using:
-    age, reach, stance, record, last-five (if missing: ignored),
-    rank, td defense, td%, ITD, decision + striking metrics.
-    Outputs win probability + finish proxy.
-    """
-    # Differences: A - B
     d = {}
     for k in ["Age", "ReachIn", "HeightIn", "WinPct", "Rank", "SLpM", "SApM", "StrDef", "StrAcc", "TDAvg", "TDAcc", "TDDef", "ITD", "DecRate"]:
         d[k] = _safe_float(a.get(k)) - _safe_float(b.get(k))
 
-    # Stance heuristic: small bump if opposite stance vs same (rough proxy)
     stance_a = (a.get("Stance") or "").lower()
     stance_b = (b.get("Stance") or "").lower()
     stance_bonus = 0.0
-    if stance_a and stance_b:
-        stance_bonus = 0.15 if stance_a != stance_b else 0.0  # tiny edge for "different look"
-    # If one is southpaw and other orthodox, slightly bigger
+    if stance_a and stance_b and stance_a != stance_b:
+        stance_bonus = 0.15
     if ("south" in stance_a and "orth" in stance_b) or ("orth" in stance_a and "south" in stance_b):
         stance_bonus = 0.25
 
-    # Convert rank diff: lower rank number is better (Rank #1 best).
-    # If ESPN gives rank as 1..N, we want advantage when A rank < B rank
     rank_adv = np.nan
     if not np.isnan(_safe_float(a.get("Rank"))) and not np.isnan(_safe_float(b.get("Rank"))):
-        rank_adv = (_safe_float(b.get("Rank")) - _safe_float(a.get("Rank")))  # positive if A ranked better
+        rank_adv = (_safe_float(b.get("Rank")) - _safe_float(a.get("Rank")))
 
-    # Build raw score with conservative weights (avoid crazy outputs when stats missing)
-    # Age: younger slightly better; reach: better; record win%: better; rank: better;
-    # striking: higher SLpM, lower SApM, higher StrDef; grappling: higher TDAvg/TDAcc, higher TDDef
-    # finish: higher ITD; decision: higher DecRate modest for "safer"
     score = 0.0
     weight_sum = 0.0
 
@@ -1080,16 +1036,15 @@ def _pick_model_row(a: dict, b: dict):
         score += w * float(term)
         weight_sum += abs(w)
 
-    # Normalize some diffs to reasonable scales
-    add(-d["Age"], 0.35)                  # younger is better
-    add(d["ReachIn"] / 4.0, 0.30)         # ~4 inches ~ 1 unit
+    add(-d["Age"], 0.35)
+    add(d["ReachIn"] / 4.0, 0.30)
     add(d["HeightIn"] / 6.0, 0.08)
     add(d["WinPct"], 0.90)
     add(rank_adv / 10.0 if rank_adv is not np.nan else np.nan, 0.55)
 
     add(d["SLpM"] / 2.0, 0.45)
     add(-d["SApM"] / 2.0, 0.35)
-    add(d["StrDef"] / 20.0, 0.22)         # if given as percent 0-100
+    add(d["StrDef"] / 20.0, 0.22)
     add(d["StrAcc"] / 20.0, 0.10)
 
     add(d["TDAvg"] / 2.0, 0.25)
@@ -1099,118 +1054,114 @@ def _pick_model_row(a: dict, b: dict):
     add(d["ITD"] / 25.0, 0.18)
     add(d["DecRate"] / 25.0, 0.08)
 
-    # stance bonus
     add(stance_bonus, 0.15)
 
-    # If everything missing, avoid divide-by-zero
     if weight_sum == 0:
-        # Pure fallback to record win% if present
         wp_a = _safe_float(a.get("WinPct"))
         wp_b = _safe_float(b.get("WinPct"))
         if not np.isnan(wp_a) and not np.isnan(wp_b) and (wp_a + wp_b) > 0:
             p = wp_a / (wp_a + wp_b)
         else:
             p = 0.50
-        finish_proxy = np.nan
-        return p, finish_proxy, 0.0
+        return float(np.clip(p, 0.05, 0.95)), np.nan, 0.0
 
-    # Logistic transform for probability
-    # scale controls how sharp the model is
     raw = score / max(0.6, (weight_sum / 3.2))
     p = 1.0 / (1.0 + math.exp(-raw))
     p = float(np.clip(p, 0.05, 0.95))
 
-    # Finish proxy: higher ITD and (higher SLpM, lower SApM) suggests finish potential.
     itd_a = _safe_float(a.get("ITD"))
     itd_b = _safe_float(b.get("ITD"))
     fin = np.nan
     if not np.isnan(itd_a) and not np.isnan(itd_b):
-        base_fin = (itd_a + itd_b) / 200.0  # if 0-100
-        # bump if winner has higher ITD
+        base_fin = (itd_a + itd_b) / 200.0
         fin = base_fin + (np.clip((itd_a - itd_b) / 100.0, -0.15, 0.15) * (p - 0.5) * 2.0)
         fin = float(np.clip(fin, 0.10, 0.85))
 
     return p, fin, float(raw)
 
-def _parse_fights_from_summary(payload: dict):
+# ---- FIXED: recursive fight extraction ----
+def _extract_fights_recursive(obj, fights_out):
     """
-    ESPN UFC summary payload varies; this tries a few structures.
-    Returns list of fights with athlete IDs and names.
+    Walk any JSON object; collect matchups that look like:
+      node['competitors'] = [ {athlete:{id,...}}, {athlete:{id,...}} ]
     """
-    fights = []
+    if isinstance(obj, dict):
+        # detect competitor nodes
+        if "competitors" in obj and isinstance(obj["competitors"], list) and len(obj["competitors"]) >= 2:
+            comps = obj["competitors"]
+            a = comps[0] if isinstance(comps[0], dict) else None
+            b = comps[1] if isinstance(comps[1], dict) else None
+            a_ath = a.get("athlete") if isinstance(a, dict) else None
+            b_ath = b.get("athlete") if isinstance(b, dict) else None
+            if isinstance(a_ath, dict) and isinstance(b_ath, dict):
+                a_id = a_ath.get("id") or a_ath.get("uid")
+                b_id = b_ath.get("id") or b_ath.get("uid")
+                a_name = a_ath.get("displayName") or a_ath.get("fullName") or ""
+                b_name = b_ath.get("displayName") or b_ath.get("fullName") or ""
+                # only accept if we have IDs
+                if a_id and b_id:
+                    fights_out.append({
+                        "fight_name": obj.get("name") or "",
+                        "weight_class": (obj.get("type", {}) or {}).get("text") if isinstance(obj.get("type"), dict) else "",
+                        "athlete_a_id": str(a_id),
+                        "athlete_a_name": str(a_name),
+                        "athlete_b_id": str(b_id),
+                        "athlete_b_name": str(b_name),
+                    })
+        # continue traversal
+        for v in obj.values():
+            _extract_fights_recursive(v, fights_out)
+    elif isinstance(obj, list):
+        for it in obj:
+            _extract_fights_recursive(it, fights_out)
 
+def _parse_fights_from_summary(payload: dict):
+    fights = []
     if not isinstance(payload, dict):
         return fights
 
-    # Common: header -> competitions -> competitors
-    # For MMA, sometimes payload['competitions'] exists
-    competitions = payload.get("competitions")
-    if isinstance(competitions, list) and competitions:
-        for comp in competitions:
-            if not isinstance(comp, dict):
-                continue
-            competitors = comp.get("competitors") or []
-            if not isinstance(competitors, list) or len(competitors) < 2:
-                continue
-            a = competitors[0].get("athlete") if isinstance(competitors[0], dict) else None
-            b = competitors[1].get("athlete") if isinstance(competitors[1], dict) else None
-            if not isinstance(a, dict) or not isinstance(b, dict):
-                continue
-            fights.append({
-                "fight_name": comp.get("name") or "",
-                "weight_class": comp.get("type", {}).get("text") if isinstance(comp.get("type"), dict) else "",
-                "athlete_a_id": str(a.get("id") or ""),
-                "athlete_a_name": str(a.get("displayName") or a.get("fullName") or ""),
-                "athlete_b_id": str(b.get("id") or ""),
-                "athlete_b_name": str(b.get("displayName") or b.get("fullName") or ""),
-            })
+    # 1) Try common direct keys first
+    for key in ["competitions", "events", "event", "header"]:
+        if key in payload:
+            _extract_fights_recursive(payload[key], fights)
 
-    # Alternate: events -> competitions (sometimes nested)
-    if not fights and "event" in payload and isinstance(payload["event"], dict):
-        ev = payload["event"]
-        competitions = ev.get("competitions") or []
-        if isinstance(competitions, list) and competitions:
-            for comp in competitions:
-                if not isinstance(comp, dict):
-                    continue
-                competitors = comp.get("competitors") or []
-                if not isinstance(competitors, list) or len(competitors) < 2:
-                    continue
-                a = competitors[0].get("athlete") if isinstance(competitors[0], dict) else None
-                b = competitors[1].get("athlete") if isinstance(competitors[1], dict) else None
-                if not isinstance(a, dict) or not isinstance(b, dict):
-                    continue
-                fights.append({
-                    "fight_name": comp.get("name") or "",
-                    "weight_class": comp.get("type", {}).get("text") if isinstance(comp.get("type"), dict) else "",
-                    "athlete_a_id": str(a.get("id") or ""),
-                    "athlete_a_name": str(a.get("displayName") or a.get("fullName") or ""),
-                    "athlete_b_id": str(b.get("id") or ""),
-                    "athlete_b_name": str(b.get("displayName") or b.get("fullName") or ""),
-                })
+    # 2) Full payload scan as fallback
+    if not fights:
+        _extract_fights_recursive(payload, fights)
 
-    return fights
+    # de-dup fights by fighter ids (order-independent)
+    seen = set()
+    uniq = []
+    for f in fights:
+        a = f.get("athlete_a_id")
+        b = f.get("athlete_b_id")
+        if not a or not b:
+            continue
+        k = tuple(sorted([str(a), str(b)]))
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(f)
+    return uniq
 
 def build_ufc_picks(event_id: str):
-    """
-    Returns:
-      - fights_df (picks + probability + key deltas)
-      - fighters_df (raw features)
-      - diagnostics dict
-    """
     summ = fetch_ufc_event_summary(event_id)
     if not summ["ok"] or not isinstance(summ["payload"], dict):
         return pd.DataFrame(), pd.DataFrame(), {"error": "Could not load UFC event summary from ESPN.", "status": summ["status"], "url": summ["url"]}
 
     fights = _parse_fights_from_summary(summ["payload"])
     if not fights:
-        return pd.DataFrame(), pd.DataFrame(), {"error": "No fights parsed from ESPN event summary (payload structure may have changed).", "status": summ["status"], "url": summ["url"]}
+        return pd.DataFrame(), pd.DataFrame(), {
+            "error": "No fights parsed from ESPN event summary (payload structure may have changed).",
+            "status": summ["status"],
+            "url": summ["url"],
+            "payload_keys": list(summ["payload"].keys())[:50]
+        }
 
-    # pull athletes
     fighter_rows = []
     for f in fights:
-        a_id = f.get("athlete_a_id","")
-        b_id = f.get("athlete_b_id","")
+        a_id = f.get("athlete_a_id", "")
+        b_id = f.get("athlete_b_id", "")
         if not a_id or not b_id:
             continue
 
@@ -1222,37 +1173,41 @@ def build_ufc_picks(event_id: str):
         a_feat = _athlete_features(a_payload)
         b_feat = _athlete_features(b_payload)
 
+        # fallback to names from fight row if athlete payload name missing
+        if not a_feat.get("Name"):
+            a_feat["Name"] = f.get("athlete_a_name", "")
+        if not b_feat.get("Name"):
+            b_feat["Name"] = f.get("athlete_b_name", "")
+
         a_feat["AthleteId"] = a_id
         b_feat["AthleteId"] = b_id
         a_feat["Side"] = "A"
         b_feat["Side"] = "B"
 
-        a_feat["Opponent"] = b_feat["Name"] or f.get("athlete_b_name","")
-        b_feat["Opponent"] = a_feat["Name"] or f.get("athlete_a_name","")
+        a_feat["Opponent"] = b_feat["Name"]
+        b_feat["Opponent"] = a_feat["Name"]
 
         a_feat["Fight"] = f"{a_feat['Name']} vs {b_feat['Name']}"
         b_feat["Fight"] = f"{a_feat['Name']} vs {b_feat['Name']}"
 
-        a_feat["WeightClass"] = f.get("weight_class","")
-        b_feat["WeightClass"] = f.get("weight_class","")
+        a_feat["WeightClass"] = f.get("weight_class", "")
+        b_feat["WeightClass"] = f.get("weight_class", "")
 
         fighter_rows.append(a_feat)
         fighter_rows.append(b_feat)
 
-        time.sleep(0.03)
+        time.sleep(0.02)
 
     fighters_df = pd.DataFrame(fighter_rows)
     if fighters_df.empty:
         return pd.DataFrame(), pd.DataFrame(), {"error": "Could not load fighter data from ESPN athlete endpoints.", "url": summ["url"]}
 
-    # Build picks per fight
     picks = []
     for fight_name, grp in fighters_df.groupby("Fight", dropna=False):
         if len(grp) < 2:
             continue
         a = grp.iloc[0].to_dict()
         b = grp.iloc[1].to_dict()
-        # ensure A/B pairing stable: set A as first row, if not, swap
         if a.get("Side") != "A":
             a, b = b, a
 
@@ -1260,7 +1215,6 @@ def build_ufc_picks(event_id: str):
         pick = a.get("Name") if p_a >= 0.5 else b.get("Name")
         prob = p_a if p_a >= 0.5 else (1.0 - p_a)
 
-        # quick deltas for display
         delta_age = _safe_float(a.get("Age")) - _safe_float(b.get("Age"))
         delta_reach = _safe_float(a.get("ReachIn")) - _safe_float(b.get("ReachIn"))
         delta_win = _safe_float(a.get("WinPct")) - _safe_float(b.get("WinPct"))
@@ -1270,7 +1224,7 @@ def build_ufc_picks(event_id: str):
 
         picks.append({
             "Fight": fight_name,
-            "WeightClass": a.get("WeightClass",""),
+            "WeightClass": a.get("WeightClass", ""),
             "Pick": pick,
             "WinProb%": round(prob * 100.0, 1),
             "ModelRaw": round(raw, 3),
@@ -1282,51 +1236,44 @@ def build_ufc_picks(event_id: str):
         })
 
     fights_df = pd.DataFrame(picks).sort_values(["WinProb%"], ascending=False) if picks else pd.DataFrame()
-    diag = {"summary_url": summ["url"], "n_fights": int(len(fights_df))}
-
+    diag = {"summary_url": summ["url"], "n_fights": int(len(fights_df)), "parsed_fights": int(len(fights))}
     return fights_df, fighters_df, diag
 
 def render_ufc():
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.subheader("🥊 UFC — Picks (ESPN data, no UFCStats scraping)")
+    st.subheader("🥊 UFC — Picks (ESPN data)")
     st.caption(
-        "Pulls upcoming card from ESPN scoreboard, then fighter bios/stats from ESPN athlete endpoints. "
-        "Model is a weighted heuristic using age/reach/stance/record + striking + takedowns + defense + ITD/decision when available."
+        "Upcoming card from ESPN scoreboard + fight list from ESPN summary. "
+        "Model uses age/reach/stance/record + striking + takedowns + defense + ITD/decision when available."
     )
 
     with st.expander("Controls", expanded=True):
         lookahead = st.slider("Look ahead days (find next card)", 1, 30, 14, step=1)
-        topn = st.slider("Show top N strongest edges (by model win prob)", 3, 15, 10, step=1)
+        topn = st.slider("Show top N strongest picks (by model win prob)", 3, 15, 10, step=1)
 
     ev = fetch_ufc_events_next_days(lookahead_days=int(lookahead))
     events = ev.get("events", [])
 
     if debug:
-        st.json({"checked_scoreboard_dates": ev.get("checked", [])})
+        st.json({"scoreboard_checks": ev.get("checked", [])})
 
     if not events:
         st.warning("No UFC events returned by ESPN scoreboard in the lookahead window. Try increasing lookahead.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    # event select
     def _label(e):
-        # date is ISO; show a compact label
-        dt = e.get("date","")
+        dt = e.get("date", "")
         try:
             dtt = pd.to_datetime(dt, errors="coerce")
-            if not pd.isna(dtt):
-                dt_str = dtt.strftime("%a %b %d, %Y %I:%M %p")
-            else:
-                dt_str = dt
+            dt_str = dtt.strftime("%a %b %d, %Y %I:%M %p") if not pd.isna(dtt) else dt
         except Exception:
             dt_str = dt
         return f"{e.get('name','UFC Event')} — {dt_str}"
 
     labels = [_label(e) for e in events]
-    idx = 0
-    choice = st.selectbox("Select Event", options=list(range(len(events))), format_func=lambda i: labels[i], index=idx)
-    event_id = events[int(choice)].get("event_id","")
+    choice = st.selectbox("Select Event", options=list(range(len(events))), format_func=lambda i: labels[i], index=0)
+    event_id = events[int(choice)].get("event_id", "")
 
     if not event_id:
         st.error("Selected event has no event_id from ESPN.")
@@ -1337,22 +1284,22 @@ def render_ufc():
         fights_df, fighters_df, diag = build_ufc_picks(event_id)
 
     if fights_df.empty:
-        st.warning("Could not build UFC picks for this event.")
-        if debug:
-            st.json(diag)
+        st.warning("Could not build UFC picks for this event (fight list parsed but model table empty or ESPN summary changed).")
+        # show diagnostics even when not in debug to help you fix quickly
+        st.info("Open debug logs to see payload details, or share the diag JSON below.")
+        st.json(diag)
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
     st.markdown("### Picks (sorted by model win probability)")
     show = fights_df.head(int(topn)).copy()
-
     st.dataframe(
         show[["Fight","WeightClass","Pick","WinProb%","FinishProxy%","ΔAge(A-B)","ΔReach(A-B)","RankAdv(A better +)","ΔWinPct(A-B)"]],
         use_container_width=True,
         hide_index=True
     )
 
-    with st.expander("Fighter data used (debug-friendly)", expanded=False):
+    with st.expander("Fighter data used", expanded=False):
         cols = [c for c in fighters_df.columns if c not in ["Side"]]
         st.dataframe(fighters_df[cols], use_container_width=True, hide_index=True)
 

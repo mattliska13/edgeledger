@@ -878,10 +878,14 @@ def build_pga_board():
 
 
 # =========================================================
-# UFC Module (UFCStats-only)  ✅ UFC-only parser fixes applied
+# UFC Module (UFCStats-first, OddsAPI fallback)  ✅ isolated
 # =========================================================
 UFCSTATS_BASE = "https://ufcstats.com"
 UFC_UPCOMING_URL = f"{UFCSTATS_BASE}/statistics/events/upcoming?page=all"
+
+# Odds API MMA fallback (DK/FD moneylines)
+MMA_SPORT_KEY = "mma_mixed_martial_arts"
+MMA_MARKET_H2H = "h2h"
 
 
 def _strip(s: str) -> str:
@@ -889,12 +893,15 @@ def _strip(s: str) -> str:
 
 
 def _utc_now() -> pd.Timestamp:
-    # Keep as Timestamp for safe comparisons
     return pd.Timestamp.utcnow()
 
 
 @st.cache_data(ttl=60 * 10)
 def ufc_fetch_text(url: str) -> Dict:
+    """
+    UFCStats fetch using UFC_SESSION (browser-ish headers).
+    If UFCStats blocks Streamlit Cloud, r.status_code often 403/503 with Cloudflare text.
+    """
     try:
         r = UFC_SESSION.get(url, timeout=20, allow_redirects=True)
         txt = r.text if isinstance(r.text, str) else ""
@@ -903,7 +910,18 @@ def ufc_fetch_text(url: str) -> Dict:
         return {"ok": False, "status": 0, "url": url, "error": str(e), "text": ""}
 
 
-# ✅ FIX #1: robust event row parser (single OR double quotes)
+def _ufcstats_blocked(html_text: str, status: int) -> bool:
+    if status in (403, 429, 503):
+        return True
+    t = (html_text or "").lower()
+    # common block pages
+    if "cloudflare" in t or "attention required" in t or "access denied" in t:
+        return True
+    if "checking your browser" in t or "ddos" in t:
+        return True
+    return False
+
+
 def _parse_event_rows(html_text: str) -> List[Dict]:
     out = []
     for m in re.finditer(r"<tr[^>]*>(.*?)</tr>", html_text, flags=re.I | re.S):
@@ -938,7 +956,6 @@ def _parse_event_rows(html_text: str) -> List[Dict]:
     return uniq
 
 
-# ✅ FIX #2: robust fight link parser (single OR double quotes)
 def _parse_fight_links(event_html: str) -> List[str]:
     links = re.findall(r"href\s*=\s*['\"]([^'\"]*fight-details[^'\"]*)['\"]", event_html, flags=re.I)
     out = []
@@ -964,16 +981,11 @@ def ufc_list_upcoming_events(upcoming_html: str) -> List[Dict]:
     if not events:
         return []
 
-    # Keep only near-future events (or undated) and sort by date
     cut = _utc_now() - pd.Timedelta(hours=8)
     cleaned = []
     for e in events:
         d = e.get("date")
         if isinstance(d, pd.Timestamp) and pd.notna(d):
-            # upcoming list sometimes includes "today" etc; keep if >= cut
-            if d.tzinfo is None:
-                # interpret as local-ish; keep simple
-                pass
             if d >= cut.normalize() - pd.Timedelta(days=2):
                 cleaned.append(e)
         else:
@@ -1010,19 +1022,17 @@ def ufc_fetch_fighter(fighter_url: str) -> Dict:
         return {"ok": False, "url": fighter_url, "error": r.get("error", ""), "status": r.get("status", 0)}
 
     html = r.get("text", "")
-    # name
+
     name = ""
     m = re.search(r"<span[^>]*class=['\"]b-content__title-highlight['\"][^>]*>(.*?)</span>", html, flags=re.I | re.S)
     if m:
         name = _strip(_html_unescape(re.sub(r"<[^>]+>", " ", m.group(1))))
 
-    # record
     rec = ""
     m = re.search(r"Record:\s*</span>\s*<span[^>]*>(.*?)</span>", html, flags=re.I | re.S)
     if m:
         rec = _strip(_html_unescape(re.sub(r"<[^>]+>", " ", m.group(1))))
 
-    # bio items (height, weight, reach, stance, dob)
     bio = {}
     for li in re.findall(r"<li[^>]*class=['\"]b-list__box-list-item['\"][^>]*>(.*?)</li>", html, flags=re.I | re.S):
         txt = _strip(_html_unescape(re.sub(r"<[^>]+>", " ", li)))
@@ -1030,7 +1040,6 @@ def ufc_fetch_fighter(fighter_url: str) -> Dict:
             k, v = txt.split(":", 1)
             bio[_strip(k)] = _strip(v)
 
-    # stats (SLpM, StrAcc, SApM, StrDef, TD Avg, TD Acc, TD Def, Sub Avg)
     stats = {}
     for box in re.findall(r"<li[^>]*class=['\"]b-list__box-list-item_type_block['\"][^>]*>(.*?)</li>", html, flags=re.I | re.S):
         txt = _strip(_html_unescape(re.sub(r"<[^>]+>", " ", box)))
@@ -1039,7 +1048,6 @@ def ufc_fetch_fighter(fighter_url: str) -> Dict:
             stats[_strip(k)] = _strip(v)
 
     def parse_reach(x):
-        # e.g. 72" or --
         x = (x or "").replace('"', "").strip()
         try:
             return float(x)
@@ -1047,7 +1055,6 @@ def ufc_fetch_fighter(fighter_url: str) -> Dict:
             return np.nan
 
     def parse_height(x):
-        # 5' 11"
         x = (x or "").strip()
         m2 = re.search(r"(\d+)\s*'\s*(\d+)", x)
         if not m2:
@@ -1057,23 +1064,16 @@ def ufc_fetch_fighter(fighter_url: str) -> Dict:
         return ft * 12.0 + inch
 
     def parse_dob_to_age(dob):
-        # e.g. Jun 10, 1990
-        try:
-            dt = pd.to_datetime(dob, errors="coerce")
-        except Exception:
-            dt = pd.NaT
+        dt = pd.to_datetime(dob, errors="coerce")
         if pd.isna(dt):
             return np.nan
-        # age in years
         return float((_utc_now() - dt).days / 365.25)
 
     reach = parse_reach(bio.get("Reach", ""))
     height = parse_height(bio.get("Height", ""))
-    stance = bio.get("STANCE", bio.get("Stance", ""))  # sometimes uppercase
+    stance = bio.get("STANCE", bio.get("Stance", ""))
     age = parse_dob_to_age(bio.get("DOB", ""))
 
-    # Normalize stat keys (UFCStats uses specific labels)
-    # Common keys observed: "SLpM", "Str. Acc.", "SApM", "Str. Def", "TD Avg.", "TD Acc.", "TD Def.", "Sub. Avg."
     slpm = _num(stats.get("SLpM", ""))
     sapm = _num(stats.get("SApM", ""))
     str_acc = _num_from_pct(stats.get("Str. Acc.", stats.get("Str. Acc", "")))
@@ -1083,7 +1083,6 @@ def ufc_fetch_fighter(fighter_url: str) -> Dict:
     td_def = _num_from_pct(stats.get("TD Def.", stats.get("TD Def", "")))
     sub_avg = _num(stats.get("Sub. Avg.", stats.get("Sub. Avg", "")))
 
-    # record W-L-D
     w = l = d = np.nan
     mrec = re.search(r"(\d+)\s*-\s*(\d+)(?:\s*-\s*(\d+))?", rec)
     if mrec:
@@ -1115,13 +1114,10 @@ def ufc_fetch_fighter(fighter_url: str) -> Dict:
         "TDAcc": td_acc,
         "TDDef": td_def,
         "SubAvg": sub_avg,
-        "raw_bio": bio if debug else None,
-        "raw_stats": stats if debug else None,
     }
 
 
 def _parse_fight_fighters(fight_html: str) -> Optional[Tuple[str, str]]:
-    # find 2 fighter links (fighter-details)
     links = re.findall(r"href\s*=\s*['\"]([^'\"]*fighter-details[^'\"]*)['\"]", fight_html, flags=re.I)
     if len(links) < 2:
         return None
@@ -1143,41 +1139,36 @@ def _sigmoid(x: float) -> float:
 
 
 def ufc_predict_pair(f1: Dict, f2: Dict) -> Dict:
-    # Feature diffs (f1 - f2)
     def nz(v, default=0.0):
         try:
             if pd.isna(v):
                 return default
         except Exception:
             pass
-        return float(v)
+        try:
+            return float(v)
+        except Exception:
+            return default
 
     age_diff = nz(f1.get("Age")) - nz(f2.get("Age"))
     reach_diff = nz(f1.get("Reach")) - nz(f2.get("Reach"))
     winpct_diff = nz(f1.get("WinPct")) - nz(f2.get("WinPct"))
 
-    # Striking composite
-    # More SLpM, less SApM, higher acc/def
     strike_1 = nz(f1.get("SLpM")) - nz(f1.get("SApM"))
     strike_2 = nz(f2.get("SLpM")) - nz(f2.get("SApM"))
     strike_diff = strike_1 - strike_2
-
     acc_def_diff = (nz(f1.get("StrAcc")) + nz(f1.get("StrDef"))) - (nz(f2.get("StrAcc")) + nz(f2.get("StrDef")))
 
-    # Grappling composite
-    # higher TD avg/acc/def + subs
     grap_1 = (0.9 * nz(f1.get("TDAvg")) + 0.03 * nz(f1.get("TDAcc")) + 0.03 * nz(f1.get("TDDef")) + 0.6 * nz(f1.get("SubAvg")))
     grap_2 = (0.9 * nz(f2.get("TDAvg")) + 0.03 * nz(f2.get("TDAcc")) + 0.03 * nz(f2.get("TDDef")) + 0.6 * nz(f2.get("SubAvg")))
     grap_diff = grap_1 - grap_2
 
-    # Stance small heuristic: orthodox vs southpaw unknown => 0
     stance_bonus = 0.0
     s1 = (f1.get("Stance") or "").lower()
     s2 = (f2.get("Stance") or "").lower()
     if s1 and s2 and s1 != s2:
-        stance_bonus = 0.05  # tiny
+        stance_bonus = 0.05
 
-    # Final score (positive favors f1)
     score = (
         0.55 * strike_diff +
         0.20 * grap_diff +
@@ -1188,83 +1179,53 @@ def ufc_predict_pair(f1: Dict, f2: Dict) -> Dict:
         stance_bonus
     )
 
-    prob_f1 = _sigmoid(score)  # proxy probability
-    pick = f1.get("name") if prob_f1 >= 0.5 else f2.get("name")
+    pA = _sigmoid(score)
+    pick = f1.get("name") if pA >= 0.5 else f2.get("name")
+    prob = float(max(0.01, min(0.99, pA if pick == f1.get("name") else 1.0 - pA)))
 
-    # Finish/Decision heuristic proxy
-    finish_potential = (
-        0.6 * max(0.0, nz(f1.get("SLpM")) * (nz(f1.get("StrAcc")) / 100.0)) +
-        0.4 * max(0.0, nz(f1.get("TDAvg")) * (nz(f1.get("TDAcc")) / 100.0) + nz(f1.get("SubAvg")))
+    # Finish/Decision proxy
+    finish_potential_A = 0.6 * max(0.0, nz(f1.get("SLpM")) * (nz(f1.get("StrAcc")) / 100.0)) + 0.4 * max(
+        0.0, nz(f1.get("TDAvg")) * (nz(f1.get("TDAcc")) / 100.0) + nz(f1.get("SubAvg"))
     )
-    finish_potential_opp = (
-        0.6 * max(0.0, nz(f2.get("SLpM")) * (nz(f2.get("StrAcc")) / 100.0)) +
-        0.4 * max(0.0, nz(f2.get("TDAvg")) * (nz(f2.get("TDAcc")) / 100.0) + nz(f2.get("SubAvg")))
+    finish_potential_B = 0.6 * max(0.0, nz(f2.get("SLpM")) * (nz(f2.get("StrAcc")) / 100.0)) + 0.4 * max(
+        0.0, nz(f2.get("TDAvg")) * (nz(f2.get("TDAcc")) / 100.0) + nz(f2.get("SubAvg"))
     )
-    durability_1 = (nz(f1.get("StrDef")) + nz(f1.get("TDDef"))) / 200.0
-    durability_2 = (nz(f2.get("StrDef")) + nz(f2.get("TDDef"))) / 200.0
+    durability_A = (nz(f1.get("StrDef")) + nz(f1.get("TDDef"))) / 200.0
+    durability_B = (nz(f2.get("StrDef")) + nz(f2.get("TDDef"))) / 200.0
 
     method = "Decision"
     if pick == f1.get("name"):
-        if (finish_potential - finish_potential_opp) > 0.35 and durability_2 < 0.55:
+        if (finish_potential_A - finish_potential_B) > 0.35 and durability_B < 0.55:
             method = "ITD (Proxy)"
     else:
-        if (finish_potential_opp - finish_potential) > 0.35 and durability_1 < 0.55:
+        if (finish_potential_B - finish_potential_A) > 0.35 and durability_A < 0.55:
             method = "ITD (Proxy)"
 
     return {
         "FighterA": f1.get("name", ""),
         "FighterB": f2.get("name", ""),
         "Pick": pick,
-        "Prob": round(float(max(0.01, min(0.99, prob_f1 if pick == f1.get("name") else 1.0 - prob_f1))), 3),
+        "Prob": round(prob, 3),
         "Method": method,
         "ScoreDiff(A-B)": round(float(score), 3),
-        "A_Age": f1.get("Age"),
-        "B_Age": f2.get("Age"),
-        "A_Reach": f1.get("Reach"),
-        "B_Reach": f2.get("Reach"),
-        "A_Stance": f1.get("Stance"),
-        "B_Stance": f2.get("Stance"),
-        "A_Record": f1.get("record"),
-        "B_Record": f2.get("record"),
-        "A_WinPct": f1.get("WinPct"),
-        "B_WinPct": f2.get("WinPct"),
-        "A_SLpM": f1.get("SLpM"),
-        "B_SLpM": f2.get("SLpM"),
-        "A_SApM": f1.get("SApM"),
-        "B_SApM": f2.get("SApM"),
-        "A_StrAcc": f1.get("StrAcc"),
-        "B_StrAcc": f2.get("StrAcc"),
-        "A_StrDef": f1.get("StrDef"),
-        "B_StrDef": f2.get("StrDef"),
-        "A_TDAvg": f1.get("TDAvg"),
-        "B_TDAvg": f2.get("TDAvg"),
-        "A_TDAcc": f1.get("TDAcc"),
-        "B_TDAcc": f2.get("TDAcc"),
-        "A_TDDef": f1.get("TDDef"),
-        "B_TDDef": f2.get("TDDef"),
-        "A_SubAvg": f1.get("SubAvg"),
-        "B_SubAvg": f2.get("SubAvg"),
     }
 
 
 @st.cache_data(ttl=60 * 30)
 def ufc_build_picks_for_event(event_url: str) -> Dict:
-    # Fetch event page
     ev = ufc_fetch_text(event_url)
     if not ev.get("ok"):
         return {"ok": False, "error": "Could not load UFC event page.", "status": ev.get("status"), "url": ev.get("url")}
 
-    txt = ev.get("text", "") if isinstance(ev.get("text"), str) else ""
-    if "Access denied" in txt or "Attention Required" in txt or "Cloudflare" in txt:
-        return {"ok": False, "error": "UFCStats appears to be blocking this server (Cloudflare/Access denied).", "event_url": ev.get("url")}
+    txt = ev.get("text", "")
+    if _ufcstats_blocked(txt, int(ev.get("status", 0) or 0)):
+        return {"ok": False, "error": "UFCStats blocked (Cloudflare/Access denied).", "status": ev.get("status"), "url": ev.get("url")}
 
     fight_links = _parse_fight_links(txt)
     if not fight_links:
         return {"ok": False, "error": "No fights parsed on this event page (HTML changed or blocked).", "event_url": ev.get("url")}
 
     picks = []
-    diag = {"event_url": ev.get("url"), "fight_count": len(fight_links), "fight_links_sample": fight_links[:3]}
-
     for fu in fight_links:
         fr = ufc_fetch_text(fu)
         if not fr.get("ok"):
@@ -1283,89 +1244,172 @@ def ufc_build_picks_for_event(event_url: str) -> Dict:
         pred = ufc_predict_pair(f1, f2)
         pred["FightURL"] = fu.replace("http://", "https://")
         picks.append(pred)
-
-        # polite pacing
         time.sleep(0.02)
 
     if not picks:
-        return {"ok": False, "error": "Fight list parsed but model table empty (fighter pages failed or markup changed).", "diag": diag}
+        return {"ok": False, "error": "Fight list parsed but picks empty (fighter pages failed or markup changed).", "event_url": ev.get("url")}
 
-    df = pd.DataFrame(picks)
-    # Order: main pick columns first
-    front = ["FighterA", "FighterB", "Pick", "Prob", "Method", "ScoreDiff(A-B)"]
-    cols = front + [c for c in df.columns if c not in front]
-    df = df[cols].copy()
-    df = df.sort_values(["Prob"], ascending=False)
+    df = pd.DataFrame(picks).sort_values("Prob", ascending=False)
+    return {"ok": True, "df": df}
 
-    return {"ok": True, "df": df, "diag": diag}
+
+# ---------- Odds API fallback (DK/FD H2H) ----------
+@st.cache_data(ttl=60 * 10)
+def mma_fetch_h2h_odds():
+    if not ODDS_API_KEY.strip():
+        return {"ok": False, "error": "Missing ODDS_API_KEY for MMA fallback."}
+
+    url = f"{ODDS_HOST}/sports/{MMA_SPORT_KEY}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": REGION,
+        "markets": MMA_MARKET_H2H,
+        "oddsFormat": "american",
+        "bookmakers": BOOKMAKERS,  # DK/FD only
+    }
+    ok, status, payload, final_url = safe_get(url, params=params, timeout=25)
+    return {"ok": ok, "status": status, "payload": payload, "url": final_url, "params": params}
+
+
+def mma_normalize_h2h(payload) -> pd.DataFrame:
+    if not is_list_of_dicts(payload):
+        return pd.DataFrame()
+
+    rows = []
+    for ev in payload:
+        home = ev.get("home_team")  # fighter A
+        away = ev.get("away_team")  # fighter B
+        matchup = f"{away} vs {home}" if home and away else (ev.get("id") or "Fight")
+        commence = ev.get("commence_time")
+
+        for bm in (ev.get("bookmakers", []) or []):
+            book = bm.get("title") or bm.get("key")
+            for mk in (bm.get("markets", []) or []):
+                if mk.get("key") != "h2h":
+                    continue
+                for out in (mk.get("outcomes", []) or []):
+                    rows.append({
+                        "Event": matchup,
+                        "Commence": commence,
+                        "Fighter": out.get("name"),
+                        "Price": out.get("price"),
+                        "Book": book,
+                    })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    return df.dropna(subset=["Fighter", "Price", "Book"])
+
+
+def mma_build_consensus_picks(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build consensus win probabilities from DK/FD, no-vig within each book, then average.
+    Then pick the higher probability fighter per fight.
+    """
+    if df.empty:
+        return df
+
+    d = df.copy()
+    d["Implied"] = d["Price"].apply(american_to_implied)
+    d["Implied"] = clamp01(pd.to_numeric(d["Implied"], errors="coerce").fillna(0.5))
+
+    # group by fight+book to remove vig
+    sums = d.groupby(["Event", "Book"])["Implied"].transform("sum")
+    d["NoVigProb"] = np.where(sums > 0, d["Implied"] / sums, np.nan)
+
+    # avg across books
+    d["ConsensusProb"] = d.groupby(["Event", "Fighter"])["NoVigProb"].transform("mean")
+    out = d.groupby(["Event", "Fighter"], as_index=False).agg(
+        ConsensusProb=("ConsensusProb", "mean"),
+        BestPrice=("Price", "max"),
+    )
+
+    # select winner per event
+    idx = out.groupby("Event")["ConsensusProb"].idxmax()
+    picks = out.loc[idx].copy()
+    picks["ConsensusProb%"] = (picks["ConsensusProb"] * 100.0).round(1)
+    picks = picks.sort_values("ConsensusProb", ascending=False)
+    return picks
 
 
 def render_ufc():
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.subheader("🥊 UFC — Fight Picks (UFCStats)")
-    st.caption("Pulls UFCStats upcoming event → event-details → fight-details → fighter-details. "
-               "Model uses Age/Reach/Stance/Record + Striking + Takedowns + Sub rate. "
-               "Finish/Decision is a heuristic proxy.")
+    st.subheader("🥊 UFC — Fight Picks")
+    st.caption(
+        "UFCStats-first for deep metrics (age/reach/stance + striking + takedowns). "
+        "If UFCStats blocks the host, we fall back to DK/FD moneyline consensus via The Odds API."
+    )
 
+    # ---- Try UFCStats upcoming ----
     up = ufc_fetch_text(UFC_UPCOMING_URL)
+    blocked = _ufcstats_blocked(up.get("text", ""), int(up.get("status", 0) or 0))
+
     if debug:
-        st.json({"ufc_upcoming": {"ok": up.get("ok"), "status": up.get("status"), "url": up.get("url")}})
+        st.json({"ufc_upcoming": {"ok": up.get("ok"), "status": up.get("status"), "url": up.get("url"), "blocked": blocked}})
 
-    if not up.get("ok"):
-        st.warning("Could not load UFC upcoming events (UFCStats blocked or down).")
+    # If UFCStats works, proceed with the deep-metrics flow
+    if up.get("ok") and not blocked:
+        events = ufc_list_upcoming_events(up.get("text", ""))
+        if not events:
+            st.warning("No UFC events found on UFCStats (markup changed). Trying Odds API fallback…")
+        else:
+            labels = []
+            for e in events[:20]:
+                d = e.get("date")
+                ds = d.strftime("%b %d, %Y") if isinstance(d, pd.Timestamp) and pd.notna(d) else ""
+                labels.append(f"{e.get('title','UFC Event')} — {ds}".strip(" —"))
+
+            selected = st.selectbox("Select event", labels, index=0, key="ufc_event_select")
+            sel_event = events[labels.index(selected)]
+            st.caption(f"Event URL: {sel_event.get('url')}")
+
+            if st.button("Build UFC Picks (Deep Metrics)", key="ufc_build_btn"):
+                with st.spinner("Loading UFCStats event & building picks..."):
+                    out = ufc_build_picks_for_event(sel_event.get("url", ""))
+                if not out.get("ok"):
+                    st.warning(out.get("error", "Could not build UFC picks for this event. Trying Odds API fallback…"))
+                else:
+                    df = out["df"]
+                    st.success(f"Built {len(df)} picks ✅")
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                    return
+
+    # ---- Odds API fallback ----
+    st.info("UFCStats is blocked/down from this host. Showing DK/FD moneyline consensus picks (fallback).")
+
+    fb = mma_fetch_h2h_odds()
+    if debug:
+        st.json({"mma_fallback": {"ok": fb.get("ok"), "status": fb.get("status"), "url": fb.get("url"), "params": fb.get("params")}})
+
+    if not fb.get("ok"):
+        st.warning(fb.get("error", "Could not load MMA odds fallback."))
         if debug:
-            st.json(up)
+            st.json(fb)
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    events = ufc_list_upcoming_events(up.get("text", ""))
-    if not events:
-        st.warning("No UFC events found from UFCStats right now (site may be blocking or markup changed).")
-        if debug:
-            st.json({"note": "parsed zero upcoming events", "url": up.get("url")})
+    df = mma_normalize_h2h(fb.get("payload"))
+    if df.empty:
+        st.warning("No MMA fights returned from The Odds API right now (DK/FD may not have posted lines yet).")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    labels = []
-    for e in events[:20]:
-        d = e.get("date")
-        ds = ""
-        if isinstance(d, pd.Timestamp) and pd.notna(d):
-            ds = d.strftime("%b %d, %Y")
-        labels.append(f"{e.get('title','UFC Event')} — {ds}".strip(" —"))
+    picks = mma_build_consensus_picks(df)
+    if picks.empty:
+        st.warning("Could not compute consensus picks from the returned odds payload.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
 
-    idx = 0
-    selected = st.selectbox("Select event", labels, index=idx, key="ufc_event_select")
-    sel_event = events[labels.index(selected)]
-    st.caption(f"Event URL: {sel_event.get('url')}")
-
-    if st.button("Build UFC Picks", key="ufc_build_btn"):
-        with st.spinner("Loading event & building picks from UFCStats..."):
-            out = ufc_build_picks_for_event(sel_event.get("url", ""))
-        if not out.get("ok"):
-            st.warning(out.get("error", "Could not build UFC picks for this event."))
-            if debug:
-                st.json(out)
-            st.markdown("</div>", unsafe_allow_html=True)
-            return
-
-        df = out["df"]
-        st.success(f"Built {len(df)} fight picks ✅")
-
-        show_cols = [
-            "FighterA", "FighterB", "Pick", "Prob", "Method", "ScoreDiff(A-B)",
-            "A_Age", "B_Age", "A_Reach", "B_Reach", "A_Stance", "B_Stance",
-            "A_Record", "B_Record",
-            "A_SLpM", "B_SLpM", "A_SApM", "B_SApM",
-            "A_StrAcc", "B_StrAcc", "A_StrDef", "B_StrDef",
-            "A_TDAvg", "B_TDAvg", "A_TDAcc", "B_TDAcc", "A_TDDef", "B_TDDef",
-            "A_SubAvg", "B_SubAvg",
-        ]
-        show_cols = [c for c in show_cols if c in df.columns]
-        st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
-
-        if debug:
-            st.json(out.get("diag", {}))
+    st.subheader("✅ DK/FD Consensus Picks (No-Vig)")
+    st.caption("These picks use no-vig probabilities within each book, averaged across DK/FD. Deep metrics are unavailable when UFCStats is blocked.")
+    st.dataframe(
+        picks[["Event", "Fighter", "ConsensusProb%", "BestPrice"]],
+        use_container_width=True,
+        hide_index=True,
+    )
 
     st.markdown("</div>", unsafe_allow_html=True)
 

@@ -1,9 +1,14 @@
+# app.py — EdgeLedger Premium (Game Lines + Player Props + PGA + UFC + Results Repo)
+# NOTE:
+# - Keeps your existing Game Lines / Player Props / PGA logic intact.
+# - Removes Tracker mode entirely.
+# - Adds a non-interactive "Results" repository that auto-snapshots top picks and grades them from live/final scores.
+# - Adds a UFC tab wired in but designed to fail-safe (will not break other modules if upstream sites block/change).
+
 import os
 import time
 import json
-from datetime import datetime
-from typing import Optional, List, Dict, Any
-
+from datetime import datetime, timezone, timedelta
 import requests
 import numpy as np
 import pandas as pd
@@ -11,15 +16,14 @@ import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
 
-# Optional OpenAI (AI Assist layer). App still runs without it.
+# Optional OpenAI layer (safe/optional)
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
-
 # =========================================================
-# Page + Premium Theme (SAFE: UI only)
+# Page + Premium Theme (UI only)
 # =========================================================
 st.set_page_config(page_title="EdgeLedger", layout="wide", initial_sidebar_state="expanded")
 
@@ -78,114 +82,26 @@ div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
 """
 st.markdown(PREMIUM_CSS, unsafe_allow_html=True)
 
-
+# =========================================================
+# Helpers
+# =========================================================
 def card_open():
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-
 
 def card_close():
     st.markdown("</div>", unsafe_allow_html=True)
 
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# =========================================================
-# Tracker (unchanged core behavior)
-# =========================================================
-TRACK_FILE = "tracker.csv"
+def _utc_now():
+    return datetime.now(timezone.utc)
 
-TRACK_COLUMNS = [
-    "LoggedAt", "Mode", "Sport", "Market", "Event", "Selection", "Line",
-    "BestBook", "BestPrice", "YourProb", "Implied", "Edge", "EV",
-    "Status", "Result"
-]
-
-
-def _load_tracker() -> pd.DataFrame:
-    if "tracker_df" in st.session_state and isinstance(st.session_state["tracker_df"], pd.DataFrame):
-        return st.session_state["tracker_df"].copy()
-
-    if os.path.exists(TRACK_FILE):
-        try:
-            df = pd.read_csv(TRACK_FILE)
-        except Exception:
-            df = pd.DataFrame(columns=TRACK_COLUMNS)
-    else:
-        df = pd.DataFrame(columns=TRACK_COLUMNS)
-
-    for c in TRACK_COLUMNS:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    st.session_state["tracker_df"] = df.copy()
-    return df
-
-
-def _save_tracker(df: pd.DataFrame):
-    st.session_state["tracker_df"] = df.copy()
+def _safe_float(x):
     try:
-        df.to_csv(TRACK_FILE, index=False)
+        return float(x)
     except Exception:
-        pass
-
-
-def _to_dt(s):
-    return pd.to_datetime(s, errors="coerce")
-
-
-def _windows(df: pd.DataFrame):
-    d = df.copy()
-    d["LoggedAt_dt"] = _to_dt(d["LoggedAt"])
-    d = d.dropna(subset=["LoggedAt_dt"])
-    now = pd.Timestamp.now()
-    today = now.normalize()
-
-    week_start = today - pd.Timedelta(days=today.weekday())
-    month_start = today.replace(day=1)
-    year_start = today.replace(month=1, day=1)
-
-    return {
-        "Today": d[d["LoggedAt_dt"] >= today],
-        "This Week": d[d["LoggedAt_dt"] >= week_start],
-        "This Month": d[d["LoggedAt_dt"] >= month_start],
-        "This Year": d[d["LoggedAt_dt"] >= year_start],
-    }
-
-
-def _summary_pick_rate(df: pd.DataFrame, label: str) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["Window", "Mode", "Picks", "Graded", "Wins", "Losses", "Pushes", "HitRate%"])
-    x = df.copy()
-    x["Picks"] = 1
-    x["Graded"] = (x["Status"] == "Graded").astype(int)
-    x["Wins"] = (x["Result"] == "W").astype(int)
-    x["Losses"] = (x["Result"] == "L").astype(int)
-    x["Pushes"] = (x["Result"] == "P").astype(int)
-
-    agg = x.groupby(["Mode"], dropna=False).agg(
-        Picks=("Picks", "sum"),
-        Graded=("Graded", "sum"),
-        Wins=("Wins", "sum"),
-        Losses=("Losses", "sum"),
-        Pushes=("Pushes", "sum"),
-    ).reset_index()
-
-    denom = (agg["Wins"] + agg["Losses"] + agg["Pushes"]).replace(0, np.nan)
-    agg["HitRate%"] = ((agg["Wins"] / denom) * 100.0).round(1).fillna(0.0)
-
-    agg.insert(0, "Window", label)
-    return agg.sort_values(["Picks", "HitRate%"], ascending=False)
-
-
-def tracker_log_rows(rows: List[Dict[str, Any]]):
-    df = _load_tracker()
-    add = pd.DataFrame(rows)
-    for c in TRACK_COLUMNS:
-        if c not in add.columns:
-            add[c] = np.nan
-    add = add[TRACK_COLUMNS].copy()
-    df = pd.concat([df, add], ignore_index=True)
-    _save_tracker(df)
-    return df
-
+        return np.nan
 
 # =========================================================
 # Keys (Secrets -> Env -> Session override)
@@ -202,15 +118,9 @@ def get_key(name: str, default: str = "") -> str:
         return v
     return default
 
-
 ODDS_API_KEY = get_key("ODDS_API_KEY", "")
-DATAGOLF_API_KEY = get_key("DATAGOLF_API_KEY", "")
-if not DATAGOLF_API_KEY:
-    DATAGOLF_API_KEY = get_key("DATAGOLF_KEY", "")
-
-# Optional AI key
+DATAGOLF_API_KEY = get_key("DATAGOLF_API_KEY", "") or get_key("DATAGOLF_KEY", "")
 OPENAI_API_KEY = get_key("OPENAI_API_KEY", "")
-
 
 # =========================================================
 # HTTP
@@ -218,8 +128,7 @@ OPENAI_API_KEY = get_key("OPENAI_API_KEY", "")
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "EdgeLedger/2.0 (streamlit)"})
 
-
-def safe_get(url: str, params: Optional[dict] = None, timeout: int = 25):
+def safe_get(url: str, params: dict | None = None, timeout: int = 25):
     try:
         r = SESSION.get(url, params=params, timeout=timeout)
         ok = 200 <= r.status_code < 300
@@ -231,21 +140,20 @@ def safe_get(url: str, params: Optional[dict] = None, timeout: int = 25):
     except Exception as e:
         return False, 0, {"error": str(e)}, url
 
+def safe_get_text(url: str, timeout: int = 25):
+    try:
+        r = SESSION.get(url, timeout=timeout)
+        ok = 200 <= r.status_code < 300
+        return ok, r.status_code, r.text, r.url
+    except Exception as e:
+        return False, 0, str(e), url
 
 def is_list_of_dicts(x):
     return isinstance(x, list) and (len(x) == 0 or isinstance(x[0], dict))
 
-
-def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
 # =========================================================
-# AI Assist (optional + isolated)
+# Optional AI Assist (non-destructive)
 # =========================================================
-AI_ENABLED_DEFAULT = False
-
-
 def ai_client():
     if not OPENAI_API_KEY or OpenAI is None:
         return None
@@ -254,133 +162,84 @@ def ai_client():
     except Exception:
         return None
 
-
-AI_JSON_SCHEMA = {
-    "name": "edgeledger_row_enrichment",
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "label": {"type": "string"},
-            "confidence": {"type": "number"},  # 0..1
-            "reasoning_bullets": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
-            "trend_flags": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
-            "edge_adjustment": {"type": "number"},  # small: -0.01..+0.01
-        },
-        "required": ["label", "confidence", "reasoning_bullets", "trend_flags", "edge_adjustment"],
-    },
-}
-
-
 @st.cache_data(ttl=60 * 15, show_spinner=False)
-def ai_enrich_rows_cached(rows_json: str) -> List[Dict[str, Any]]:
+def ai_enrich_rows_cached(rows_json: str) -> list[dict]:
     cli = ai_client()
     if cli is None:
         return []
-
     rows = json.loads(rows_json)
+
+    # Keep payload light
     prompt_rows = []
     for r in rows:
         prompt_rows.append({
-            "Sport": r.get("Sport", ""),
-            "Market": r.get("Market", ""),
-            "Event": r.get("Event", ""),
-            "Selection": r.get("Selection", ""),
-            "Line": r.get("Line", ""),
-            "BestPrice": r.get("BestPrice", ""),
+            "Sport": r.get("Sport",""),
+            "Market": r.get("Market",""),
+            "Event": r.get("Event",""),
+            "Selection": r.get("Selection",""),
+            "Line": r.get("Line",""),
+            "BestPrice": r.get("BestPrice",""),
             "YourProb": r.get("YourProb", None),
             "ImpliedBest": r.get("ImpliedBest", None),
             "Edge": r.get("Edge", None),
         })
 
-    # One call batch
+    # Minimal schema-ish output without requiring special SDK features across environments
+    # (returns JSON list; safe parse)
     resp = cli.responses.create(
         model="gpt-4.1-mini",
         input=[{
             "role": "user",
             "content": (
                 "You are a sports betting analytics assistant. "
-                "Given rows with probabilities and prices, produce concise enrichment for each row: "
-                "1) short label, 2) confidence 0..1, 3) 3-6 bullets, 4) trend flags, "
-                "5) tiny edge adjustment between -0.01 and +0.01 ONLY when strongly justified.\n\n"
-                f"ROWS:\n{json.dumps(prompt_rows)}"
+                "For each row, return JSON with: label (short), confidence (0..1), "
+                "reasoning_bullets (3-6 short), trend_flags (0-6 short). "
+                "Do not hallucinate injuries/news. Use only what is in the row.\n\n"
+                f"ROWS:\n{json.dumps(prompt_rows)}\n\n"
+                "Return ONLY JSON: {\"items\":[...]}."
             )
         }],
-        text={
-            "format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "edgeledger_enrichment_batch",
-                    "schema": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "items": {"type": "array", "items": AI_JSON_SCHEMA["schema"]}
-                        },
-                        "required": ["items"]
-                    }
-                }
-            }
-        },
     )
-
     try:
         out = json.loads(resp.output_text)
         return out.get("items", []) if isinstance(out, dict) else []
     except Exception:
         return []
 
-
 def apply_ai_enrichment(df_best: pd.DataFrame, sport: str, market: str, max_rows: int = 25) -> pd.DataFrame:
     if df_best.empty:
         return df_best
-
     rows = []
     for _, r in df_best.head(max_rows).iterrows():
-        sel = r.get("Outcome", None)
-        if sel is None:
-            # props
-            if "Player" in df_best.columns:
-                sel = (str(r.get("Player", "")) + " " + str(r.get("Side", ""))).strip()
-            else:
-                sel = str(r.get("Selection", ""))
-
         rows.append({
             "Sport": sport,
             "Market": market,
-            "Event": r.get("Event", ""),
-            "Selection": sel,
-            "Line": r.get("LineBucket", r.get("Line", "")),
-            "BestPrice": r.get("BestPrice", ""),
-            "YourProb": float(r.get("YourProb", np.nan)) if r.get("YourProb") is not None else None,
-            "ImpliedBest": float(r.get("ImpliedBest", np.nan)) if r.get("ImpliedBest") is not None else None,
-            "Edge": float(r.get("Edge", np.nan)) if r.get("Edge") is not None else None,
+            "Event": r.get("Event",""),
+            "Selection": r.get("Outcome", r.get("Selection","")),
+            "Line": r.get("LineBucket", r.get("Line","")),
+            "BestPrice": r.get("BestPrice",""),
+            "YourProb": float(r.get("YourProb", np.nan)) if pd.notna(r.get("YourProb", np.nan)) else None,
+            "ImpliedBest": float(r.get("ImpliedBest", np.nan)) if pd.notna(r.get("ImpliedBest", np.nan)) else None,
+            "Edge": float(r.get("Edge", np.nan)) if pd.notna(r.get("Edge", np.nan)) else None,
         })
-
     enrich = ai_enrich_rows_cached(json.dumps(rows))
     out = df_best.copy()
     if not enrich:
         return out
 
-    for c in ["AI_Label", "AI_Conf", "AI_Flags", "AI_Notes", "AI_EdgeAdj"]:
+    for c in ["AI_Label","AI_Conf","AI_Flags","AI_Notes"]:
         if c not in out.columns:
-            out[c] = "" if c != "AI_Conf" else np.nan
+            out[c] = ""
 
     for i, e in enumerate(enrich[:max_rows]):
-        idx = out.index[i]
-        out.loc[idx, "AI_Label"] = e.get("label", "")
-        out.loc[idx, "AI_Conf"] = float(e.get("confidence", 0.0))
-        out.loc[idx, "AI_Flags"] = ", ".join(e.get("trend_flags", []) or [])
-        out.loc[idx, "AI_Notes"] = " • ".join(e.get("reasoning_bullets", []) or [])
-        out.loc[idx, "AI_EdgeAdj"] = float(e.get("edge_adjustment", 0.0))
-
-    out["Edge_AI"] = pd.to_numeric(out.get("Edge", np.nan), errors="coerce")
-    out["Edge_AI"] = out["Edge_AI"] + pd.to_numeric(out["AI_EdgeAdj"], errors="coerce").fillna(0.0)
+        out.loc[out.index[i], "AI_Label"] = str(e.get("label",""))
+        out.loc[out.index[i], "AI_Conf"] = float(e.get("confidence", 0.0) or 0.0)
+        out.loc[out.index[i], "AI_Flags"] = ", ".join(e.get("trend_flags", []) or [])
+        out.loc[out.index[i], "AI_Notes"] = " • ".join(e.get("reasoning_bullets", []) or [])
     return out
 
-
 # =========================================================
-# Odds math
+# Odds math (unchanged)
 # =========================================================
 def american_to_implied(odds) -> float:
     try:
@@ -391,14 +250,11 @@ def american_to_implied(odds) -> float:
         return 100.0 / (o + 100.0)
     return (-o) / ((-o) + 100.0)
 
-
 def clamp01(x):
     return np.clip(x, 0.001, 0.999)
 
-
 def pct01_to_100(series01):
     return (pd.to_numeric(series01, errors="coerce") * 100.0).round(2)
-
 
 def line_bucket_half_point(x):
     try:
@@ -406,7 +262,6 @@ def line_bucket_half_point(x):
     except Exception:
         return np.nan
     return round(v * 2.0) / 2.0
-
 
 # =========================================================
 # API Config (The Odds API)
@@ -424,13 +279,11 @@ SPORT_KEYS_PROPS = {
     "NFL": "americanfootball_nfl",
     "CFB": "americanfootball_ncaaf",
 }
-
 GAME_MARKETS = {
     "Moneyline": "h2h",
     "Spreads": "spreads",
     "Totals": "totals",
 }
-
 PROP_MARKETS = {
     "Anytime TD": "player_anytime_td",
     "Passing TDs": "player_pass_tds",
@@ -439,7 +292,6 @@ PROP_MARKETS = {
     "Receiving Yards": "player_reception_yds",
     "Receptions": "player_receptions",
 }
-
 
 # =========================================================
 # Sidebar UI
@@ -451,13 +303,17 @@ st.sidebar.markdown("---")
 debug = st.sidebar.checkbox("Show debug logs", value=False)
 show_non_value = st.sidebar.checkbox("Show non-value rows (Edge ≤ 0)", value=False)
 
-mode = st.sidebar.radio("Mode", ["Game Lines", "Player Props", "PGA", "Tracker"], index=0)
+mode = st.sidebar.radio(
+    "Mode",
+    ["Game Lines", "Player Props", "PGA", "UFC", "Results"],
+    index=0
+)
 
 with st.sidebar.expander("API Keys (session-only override)", expanded=False):
     st.caption("If Secrets aren’t set, paste keys here (session-only).")
     odds_in = st.text_input("ODDS_API_KEY", value=ODDS_API_KEY or "", type="password")
     dg_in = st.text_input("DATAGOLF_KEY / DATAGOLF_API_KEY", value=DATAGOLF_API_KEY or "", type="password")
-    oa_in = st.text_input("OPENAI_API_KEY (optional AI Assist)", value=OPENAI_API_KEY or "", type="password")
+    oa_in = st.text_input("OPENAI_API_KEY (optional)", value=OPENAI_API_KEY or "", type="password")
     if odds_in.strip():
         st.session_state["ODDS_API_KEY"] = odds_in.strip()
         ODDS_API_KEY = odds_in.strip()
@@ -469,13 +325,12 @@ with st.sidebar.expander("API Keys (session-only override)", expanded=False):
         OPENAI_API_KEY = oa_in.strip()
 
 with st.sidebar.expander("AI Assist (optional)", expanded=False):
-    ai_on = st.toggle("Enable AI Assist (labels + trend notes)", value=AI_ENABLED_DEFAULT)
-    st.caption("AI Assist never replaces your math. It adds notes + optional tiny Edge_AI adjustment.")
+    ai_on = st.toggle("Enable AI Assist (labels + notes)", value=False)
+    st.caption("AI Assist never replaces your math. It only adds short labels/notes.")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("<span class='pill'>Books: DK + FD</span>", unsafe_allow_html=True)
 st.sidebar.markdown(f"<span class='pill'>Updated: {now_str()}</span>", unsafe_allow_html=True)
-
 
 # =========================================================
 # Header
@@ -483,14 +338,13 @@ st.sidebar.markdown(f"<span class='pill'>Updated: {now_str()}</span>", unsafe_al
 st.markdown("<div class='big-title'>EdgeLedger</div>", unsafe_allow_html=True)
 st.caption(
     "Ranked by **Edge = YourProb − ImpliedProb(best price)**. "
-    "**Strict contradiction removal**: only one side per game/market (and one side per player/market). "
-    "DK/FD only. Modules run independently. AI Assist is optional and non-destructive."
+    "Modules run independently (no cross-impact). "
+    "Results repo auto-snapshots top picks + auto-grades from scores."
 )
 
-if not ODDS_API_KEY.strip() and mode != "Tracker":
-    st.error('Missing ODDS_API_KEY. Add it in Streamlit Secrets as ODDS_API_KEY="..." or paste it in the sidebar expander.')
+if not ODDS_API_KEY.strip() and mode in ["Game Lines", "Player Props", "Results"]:
+    st.error('Missing ODDS_API_KEY. Add it in Streamlit Secrets as ODDS_API_KEY="..." or paste it in the sidebar.')
     st.stop()
-
 
 # =========================================================
 # Caching (daily)
@@ -508,14 +362,12 @@ def fetch_game_lines(sport_key: str):
     ok, status, payload, final_url = safe_get(url, params=params)
     return {"ok": ok, "status": status, "payload": payload, "url": final_url, "params": params}
 
-
 @st.cache_data(ttl=60 * 60 * 24)
 def fetch_events(sport_key: str):
     url = f"{ODDS_HOST}/sports/{sport_key}/events"
     params = {"apiKey": ODDS_API_KEY}
     ok, status, payload, final_url = safe_get(url, params=params)
     return {"ok": ok, "status": status, "payload": payload, "url": final_url, "params": params}
-
 
 @st.cache_data(ttl=60 * 60 * 24)
 def fetch_event_odds(sport_key: str, event_id: str, market_key: str):
@@ -530,21 +382,29 @@ def fetch_event_odds(sport_key: str, event_id: str, market_key: str):
     ok, status, payload, final_url = safe_get(url, params=params)
     return {"ok": ok, "status": status, "payload": payload, "url": final_url, "params": params}
 
+@st.cache_data(ttl=60 * 10)
+def fetch_scores(sport_key: str, days_from: int = 7):
+    # v4 scores endpoint
+    url = f"{ODDS_HOST}/sports/{sport_key}/scores"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "daysFrom": int(days_from),
+    }
+    ok, status, payload, final_url = safe_get(url, params=params, timeout=30)
+    return {"ok": ok, "status": status, "payload": payload, "url": final_url, "params": params}
 
 # =========================================================
-# Normalizers
+# Normalizers (unchanged)
 # =========================================================
 def normalize_lines(raw):
     rows = []
     if not is_list_of_dicts(raw):
         return pd.DataFrame()
-
     for ev in raw:
         home = ev.get("home_team")
         away = ev.get("away_team")
         matchup = f"{away} @ {home}"
         commence = ev.get("commence_time")
-
         for bm in (ev.get("bookmakers", []) or []):
             book = bm.get("title") or bm.get("key")
             for mk in (bm.get("markets", []) or []):
@@ -562,13 +422,11 @@ def normalize_lines(raw):
                         "Price": out.get("price"),
                         "Book": book,
                     })
-
     df = pd.DataFrame(rows)
     if df.empty:
         return df
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
     return df.dropna(subset=["Market", "Outcome", "Price"])
-
 
 def normalize_props(event_payload):
     rows = []
@@ -588,10 +446,8 @@ def normalize_props(event_payload):
                 side = out.get("description")  # Over/Under usually; may be blank
                 line = out.get("point")
                 price = out.get("price")
-
                 if player is None or price is None:
                     continue
-
                 rows.append({
                     "Scope": "Prop",
                     "Event": matchup,
@@ -610,9 +466,8 @@ def normalize_props(event_payload):
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
     return df.dropna(subset=["Market", "Player", "Price"])
 
-
 # =========================================================
-# Core Best-Bet Logic (Implied vs YourProb)
+# Core Best-Bet Logic (unchanged)
 # =========================================================
 def add_implied(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -620,14 +475,12 @@ def add_implied(df: pd.DataFrame) -> pd.DataFrame:
     out["Implied"] = clamp01(pd.to_numeric(out["Implied"], errors="coerce").fillna(0.5))
     return out
 
-
 def compute_no_vig_within_book_two_way(df: pd.DataFrame, group_cols_book: list) -> pd.DataFrame:
     out = df.copy()
     out["Implied"] = clamp01(pd.to_numeric(out["Implied"], errors="coerce").fillna(0.5))
     sums = out.groupby(group_cols_book)["Implied"].transform("sum")
     out["NoVigProb"] = np.where(sums > 0, out["Implied"] / sums, np.nan)
     return out
-
 
 def estimate_your_prob(df: pd.DataFrame, key_cols: list, book_cols: list) -> pd.DataFrame:
     """
@@ -653,7 +506,6 @@ def estimate_your_prob(df: pd.DataFrame, key_cols: list, book_cols: list) -> pd.
     out = out.drop(columns=["_n_sides"], errors="ignore")
     return out
 
-
 def best_price_and_edge(df: pd.DataFrame, group_cols_best: list) -> pd.DataFrame:
     if df.empty:
         return df.copy()
@@ -673,7 +525,6 @@ def best_price_and_edge(df: pd.DataFrame, group_cols_best: list) -> pd.DataFrame
     best["EV"] = (best["Edge"] * 100.0)
     return best
 
-
 def strict_no_contradictions(df_best: pd.DataFrame, contradiction_cols: list) -> pd.DataFrame:
     """
     STRICT contradiction removal:
@@ -686,7 +537,6 @@ def strict_no_contradictions(df_best: pd.DataFrame, contradiction_cols: list) ->
     idx = out.groupby(contradiction_cols, dropna=False)["Edge"].idxmax()
     return out.loc[idx].sort_values("Edge", ascending=False)
 
-
 def filter_value(df_best: pd.DataFrame, show_non_value: bool) -> pd.DataFrame:
     out = df_best.copy()
     out["Edge"] = pd.to_numeric(out["Edge"], errors="coerce")
@@ -694,7 +544,6 @@ def filter_value(df_best: pd.DataFrame, show_non_value: bool) -> pd.DataFrame:
     if show_non_value:
         return out
     return out[out["Edge"] > 0]
-
 
 def decorate_probs(df_best: pd.DataFrame) -> pd.DataFrame:
     if df_best.empty:
@@ -706,9 +555,8 @@ def decorate_probs(df_best: pd.DataFrame) -> pd.DataFrame:
     out["EV"] = pd.to_numeric(out["EV"], errors="coerce").round(2)
     return out
 
-
 # =========================================================
-# Boards
+# Boards (unchanged)
 # =========================================================
 def build_game_lines_board(sport: str, bet_type: str):
     sport_key = SPORT_KEYS_LINES[sport]
@@ -748,7 +596,6 @@ def build_game_lines_board(sport: str, bet_type: str):
     df_best = decorate_probs(df_best)
     df_best = df_best.sort_values("Edge", ascending=False)
     return df_best, {}
-
 
 def build_props_board(sport: str, prop_label: str, max_events_scan: int = 8):
     sport_key = SPORT_KEYS_PROPS[sport]
@@ -806,7 +653,6 @@ def build_props_board(sport: str, prop_label: str, max_events_scan: int = 8):
     df_best = df_best.sort_values("Edge", ascending=False)
     return df_best, {}
 
-
 # =========================================================
 # Charts
 # =========================================================
@@ -822,18 +668,15 @@ def bar_prob(df, label_col, prob_col_percent, title):
     plt.tight_layout()
     st.pyplot(fig)
 
-
 # =========================================================
-# PGA — Advanced DataGolf Module (independent)
+# PGA — Advanced DataGolf Module (unchanged)
 # =========================================================
 DG_HOST = "https://feeds.datagolf.com"
-
 
 def _dg_get(path: str, params: dict):
     url = f"{DG_HOST}{path}"
     ok, status, payload, final_url = safe_get(url, params=params, timeout=30)
     return {"ok": ok, "status": status, "payload": payload, "url": final_url}
-
 
 def _dg_find_rows(payload):
     if isinstance(payload, list) and (len(payload) == 0 or isinstance(payload[0], dict)):
@@ -868,12 +711,10 @@ def _dg_find_rows(payload):
 
     return [], meta
 
-
 def _normalize_name(s: str) -> str:
     if not isinstance(s, str):
         return ""
     return " ".join(s.strip().split()).lower()
-
 
 def _first_col(df: pd.DataFrame, candidates: list):
     for c in candidates:
@@ -881,10 +722,9 @@ def _first_col(df: pd.DataFrame, candidates: list):
             return c
     return None
 
-
 def build_pga_board():
     if not DATAGOLF_API_KEY.strip():
-        return pd.DataFrame(), {"error": 'Missing DATAGOLF_KEY. Add it in Streamlit Secrets as DATAGOLF_KEY="..." (or DATAGOLF_API_KEY). PGA is hidden until then.'}
+        return {}, {"error": 'Missing DATAGOLF_KEY. Add it in Streamlit Secrets as DATAGOLF_KEY="..." (or DATAGOLF_API_KEY).'}
 
     pre_params = {
         "tour": "pga",
@@ -909,17 +749,16 @@ def build_pga_board():
         })
 
     if not pre["ok"]:
-        return pd.DataFrame(), {"error": "DataGolf pre-tournament call failed", "status": pre["status"], "payload": pre["payload"]}
+        return {}, {"error": "DataGolf pre-tournament call failed", "status": pre["status"], "payload": pre["payload"]}
 
     pre_rows, meta = _dg_find_rows(pre["payload"])
     if not pre_rows:
-        return pd.DataFrame(), {"error": "No PGA prediction rows returned from DataGolf (parsed none).", "dg_meta": meta}
+        return {}, {"error": "No PGA prediction rows returned from DataGolf.", "dg_meta": meta}
 
     df_pre = pd.DataFrame(pre_rows)
-
     name_col = _first_col(df_pre, ["player_name", "name", "golfer", "player"])
     if not name_col:
-        return pd.DataFrame(), {"error": "Could not find player name column in DataGolf pre-tournament payload."}
+        return {}, {"error": "Could not find player name column in DataGolf payload."}
 
     win_col = None
     top10_col = None
@@ -931,11 +770,10 @@ def build_pga_board():
             top10_col = c
 
     if not win_col:
-        return pd.DataFrame(), {"error": "Could not locate win probability column in DataGolf pre-tournament data."}
+        return {}, {"error": "Could not locate win probability column."}
 
     df_pre["Player"] = df_pre[name_col].astype(str)
     df_pre["PlayerKey"] = df_pre["Player"].apply(_normalize_name)
-
     df_pre["WinProb"] = pd.to_numeric(df_pre[win_col], errors="coerce") / 100.0
     df_pre["Top10Prob"] = pd.to_numeric(df_pre[top10_col], errors="coerce") / 100.0 if top10_col else np.nan
 
@@ -1002,7 +840,6 @@ def build_pga_board():
 
     df["z_win"] = z(df["WinProb"])
     df["z_top10"] = z(df["Top10Prob"]) if df["Top10Prob"].notna().any() else 0.0
-
     df["z_skill"] = z(df["SkillRating"]) if "SkillRating" in df.columns else 0.0
     df["z_t2g"] = z(df["SG_T2G"]) if "SG_T2G" in df.columns else 0.0
     df["z_putt"] = z(df["SG_Putt"]) if "SG_Putt" in df.columns else 0.0
@@ -1020,7 +857,6 @@ def build_pga_board():
         0.06 * df["z_hist"] +
         0.05 * df["z_bogey"]
     )
-
     df["Top10Score"] = (
         0.55 * df["z_top10"] +
         0.12 * df["z_t2g"] +
@@ -1030,12 +866,7 @@ def build_pga_board():
         0.06 * df["z_hist"] +
         0.06 * df["z_bogey"]
     )
-
-    df["OADScore"] = (
-        0.55 * df["Top10Score"] +
-        0.25 * df["WinScore"] +
-        0.20 * df["z_t2g"]
-    )
+    df["OADScore"] = 0.55 * df["Top10Score"] + 0.25 * df["WinScore"] + 0.20 * df["z_t2g"]
 
     df["Win%"] = pct01_to_100(df["WinProb"])
     df["Top10%"] = pct01_to_100(df["Top10Prob"]) if df["Top10Prob"].notna().any() else np.nan
@@ -1046,58 +877,480 @@ def build_pga_board():
 
     return {"winners": winners, "top10s": top10s, "oad": oad, "meta": meta}, {}
 
-
 # =========================================================
-# Tracker Page UI
+# Results Repository (NEW, no interaction)
 # =========================================================
-def render_tracker():
-    card_open()
-    st.subheader("📈 Tracker — Pick Rate + Hit Rate")
-    st.caption("Log picks from any section, then grade them (W/L/P/N/A). Summaries auto-calc by window.")
+RESULTS_FILE = "results_repo.json"
 
-    df = _load_tracker()
-
-    win_map = _windows(df)
-    tables = []
-    for label, sub in win_map.items():
-        s = _summary_pick_rate(sub, label)
-        if not s.empty:
-            tables.append(s)
-
-    if tables:
-        summary = pd.concat(tables, ignore_index=True)
-        st.markdown("### Summary (Today / Week / Month / Year)")
-        st.dataframe(
-            summary[["Window", "Mode", "Picks", "Graded", "Wins", "Losses", "Pushes", "HitRate%"]],
-            use_container_width=True,
-            hide_index=True
-        )
+def _load_results_repo() -> dict:
+    if "results_repo" in st.session_state and isinstance(st.session_state["results_repo"], dict):
+        return json.loads(json.dumps(st.session_state["results_repo"]))
+    if os.path.exists(RESULTS_FILE):
+        try:
+            with open(RESULTS_FILE, "r", encoding="utf-8") as f:
+                repo = json.load(f)
+        except Exception:
+            repo = {}
     else:
-        st.info("No tracked picks yet. Log picks from Game Lines / Props / PGA.")
+        repo = {}
+    if not isinstance(repo, dict):
+        repo = {}
+    if "snapshots" not in repo:
+        repo["snapshots"] = []
+    st.session_state["results_repo"] = json.loads(json.dumps(repo))
+    return repo
 
-    st.markdown("### Grade Picks")
-    st.caption("Set Status=Graded and Result=W/L/P/N/A. (Leaving Pending means not counted in hit rate.)")
+def _save_results_repo(repo: dict):
+    st.session_state["results_repo"] = json.loads(json.dumps(repo))
+    try:
+        with open(RESULTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(repo, f, indent=2)
+    except Exception:
+        pass
 
+def _today_key_local():
+    # Local day key to bucket snapshots (simple)
+    return datetime.now().strftime("%Y-%m-%d")
+
+def _snapshot_exists(repo: dict, day_key: str, sport: str) -> bool:
+    for s in repo.get("snapshots", []):
+        if s.get("day") == day_key and s.get("sport") == sport and s.get("type") == "top10_ml_spreads":
+            return True
+    return False
+
+def _make_top10_snapshot_for_sport(sport: str) -> dict | None:
+    # top10 Moneyline + top10 Spreads (value-filtered already unless show_non_value)
+    # If no rows, returns None
+    out = {"day": _today_key_local(), "sport": sport, "type": "top10_ml_spreads", "created_at": datetime.now().isoformat(), "items": []}
+
+    # Moneyline
+    df_ml, err1 = build_game_lines_board(sport, "Moneyline")
+    if df_ml is not None and not df_ml.empty:
+        take = df_ml.head(10).copy()
+        for _, r in take.iterrows():
+            out["items"].append({
+                "sport": sport,
+                "bet_type": "Moneyline",
+                "market_key": "h2h",
+                "event": r.get("Event",""),
+                "selection": r.get("Outcome",""),
+                "line": None,
+                "line_bucket": None,
+                "best_price": r.get("BestPrice", None),
+                "best_book": r.get("BestBook", ""),
+                "your_prob": float(r.get("YourProb", np.nan)) if pd.notna(r.get("YourProb", np.nan)) else None,
+                "implied_best": float(r.get("ImpliedBest", np.nan)) if pd.notna(r.get("ImpliedBest", np.nan)) else None,
+                "edge": float(r.get("Edge", np.nan)) if pd.notna(r.get("Edge", np.nan)) else None,
+                "status": "Pending",
+                "result": "",
+                "graded_at": None,
+            })
+
+    # Spreads
+    df_sp, err2 = build_game_lines_board(sport, "Spreads")
+    if df_sp is not None and not df_sp.empty:
+        take = df_sp.head(10).copy()
+        for _, r in take.iterrows():
+            out["items"].append({
+                "sport": sport,
+                "bet_type": "Spreads",
+                "market_key": "spreads",
+                "event": r.get("Event",""),
+                "selection": r.get("Outcome",""),
+                "line": float(r.get("LineBucket", np.nan)) if pd.notna(r.get("LineBucket", np.nan)) else None,
+                "line_bucket": float(r.get("LineBucket", np.nan)) if pd.notna(r.get("LineBucket", np.nan)) else None,
+                "best_price": r.get("BestPrice", None),
+                "best_book": r.get("BestBook", ""),
+                "your_prob": float(r.get("YourProb", np.nan)) if pd.notna(r.get("YourProb", np.nan)) else None,
+                "implied_best": float(r.get("ImpliedBest", np.nan)) if pd.notna(r.get("ImpliedBest", np.nan)) else None,
+                "edge": float(r.get("Edge", np.nan)) if pd.notna(r.get("Edge", np.nan)) else None,
+                "status": "Pending",
+                "result": "",
+                "graded_at": None,
+            })
+
+    if len(out["items"]) == 0:
+        return None
+    return out
+
+def _parse_event_teams(event_str: str):
+    # event format: "Away @ Home"
+    if not isinstance(event_str, str):
+        return None, None
+    if " @ " in event_str:
+        away, home = event_str.split(" @ ", 1)
+        return away.strip(), home.strip()
+    return None, None
+
+def _grade_moneyline(selection: str, home: str, away: str, home_score: int, away_score: int):
+    if any(x is None for x in [selection, home, away, home_score, away_score]):
+        return None
+    winner = home if home_score > away_score else away if away_score > home_score else "TIE"
+    if winner == "TIE":
+        return "P"
+    return "W" if str(selection).strip() == str(winner).strip() else "L"
+
+def _grade_spread(selection: str, home: str, away: str, home_score: int, away_score: int, line: float):
+    # line is the point for that selection (Odds API: outcome point is the spread for that team)
+    # If you bet selection with spread line, you win if (team_score + line) > opponent_score, push if ==, lose if <
+    if any(x is None for x in [selection, home, away, home_score, away_score, line]):
+        return None
+    sel = str(selection).strip()
+    if sel == str(home).strip():
+        adj = home_score + float(line)
+        opp = away_score
+    elif sel == str(away).strip():
+        adj = away_score + float(line)
+        opp = home_score
+    else:
+        return None
+    if abs(adj - opp) < 1e-9:
+        return "P"
+    return "W" if adj > opp else "L"
+
+def _scores_map_by_matchup(payload):
+    """
+    Map: "Away @ Home" -> dict(home_score, away_score, completed, commence_time)
+    The Odds API scores payload varies; handle defensively.
+    """
+    mp = {}
+    if not is_list_of_dicts(payload):
+        return mp
+    for ev in payload:
+        home = ev.get("home_team")
+        away = ev.get("away_team")
+        matchup = f"{away} @ {home}"
+        completed = bool(ev.get("completed", False))
+        commence = ev.get("commence_time")
+        home_score = None
+        away_score = None
+        # scores list could be [{name, score}, ...]
+        scores = ev.get("scores")
+        if isinstance(scores, list):
+            for s in scores:
+                if not isinstance(s, dict):
+                    continue
+                nm = s.get("name")
+                sc = s.get("score")
+                try:
+                    sc_i = int(sc)
+                except Exception:
+                    sc_i = None
+                if nm == home:
+                    home_score = sc_i
+                if nm == away:
+                    away_score = sc_i
+        mp[matchup] = {
+            "home": home,
+            "away": away,
+            "home_score": home_score,
+            "away_score": away_score,
+            "completed": completed,
+            "commence_time": commence,
+        }
+    return mp
+
+def grade_repo_from_scores(repo: dict, days_from: int = 14):
+    # Grade any Pending items where scores are completed and have scores.
+    checked = 0
+    graded = 0
+    notes = []
+    snaps = repo.get("snapshots", [])
+    if not isinstance(snaps, list) or len(snaps) == 0:
+        return repo, {"graded": 0, "checked": 0, "notes": ["No snapshots."]}
+
+    # Build scores cache per sport_key used
+    for sport, sport_key in SPORT_KEYS_LINES.items():
+        # only if there are pending items for that sport
+        has_pending = False
+        for s in snaps:
+            if s.get("sport") != sport:
+                continue
+            for it in s.get("items", []):
+                if it.get("status") == "Pending":
+                    has_pending = True
+                    break
+            if has_pending:
+                break
+        if not has_pending:
+            continue
+
+        sc = fetch_scores(sport_key, days_from=days_from)
+        if debug:
+            st.json({"scores": {"sport": sport, "status": sc["status"], "url": sc["url"]}})
+        if not sc["ok"]:
+            notes.append(f"Scores fetch failed for {sport}: {sc['status']}")
+            continue
+
+        mp = _scores_map_by_matchup(sc["payload"])
+        for s in snaps:
+            if s.get("sport") != sport:
+                continue
+            for it in s.get("items", []):
+                if it.get("status") != "Pending":
+                    continue
+                checked += 1
+                ev = it.get("event")
+                m = mp.get(ev)
+                if not m or not m.get("completed"):
+                    continue
+                hs, as_ = m.get("home_score"), m.get("away_score")
+                if hs is None or as_ is None:
+                    continue
+                bet_type = it.get("bet_type")
+                sel = it.get("selection")
+                home = m.get("home")
+                away = m.get("away")
+                if bet_type == "Moneyline":
+                    r = _grade_moneyline(sel, home, away, hs, as_)
+                elif bet_type == "Spreads":
+                    r = _grade_spread(sel, home, away, hs, as_, it.get("line_bucket"))
+                else:
+                    r = None
+                if r in ["W", "L", "P"]:
+                    it["result"] = r
+                    it["status"] = "Graded"
+                    it["graded_at"] = datetime.now().isoformat()
+                    graded += 1
+
+    repo["snapshots"] = snaps
+    return repo, {"graded": graded, "checked": checked, "notes": notes}
+
+def repo_items_df(repo: dict) -> pd.DataFrame:
+    rows = []
+    for s in repo.get("snapshots", []) or []:
+        day = s.get("day")
+        sport = s.get("sport")
+        for it in s.get("items", []) or []:
+            rows.append({
+                "Day": day,
+                "Sport": sport,
+                "BetType": it.get("bet_type"),
+                "Event": it.get("event"),
+                "Selection": it.get("selection"),
+                "Line": it.get("line_bucket"),
+                "BestPrice": it.get("best_price"),
+                "BestBook": it.get("best_book"),
+                "YourProb": it.get("your_prob"),
+                "ImpliedBest": it.get("implied_best"),
+                "Edge": it.get("edge"),
+                "Status": it.get("status"),
+                "Result": it.get("result"),
+            })
+    df = pd.DataFrame(rows)
     if df.empty:
-        st.info("Tracker is empty.")
-    else:
-        df["Status"] = df["Status"].fillna("Pending")
-        df["Result"] = df["Result"].fillna("")
-        edited = st.data_editor(df, use_container_width=True, num_rows="dynamic", key="tracker_editor")
-        if st.button("Save Tracker"):
-            _save_tracker(edited)
-            st.success("Saved.")
+        return df
+    # normalize dates
+    df["Day_dt"] = pd.to_datetime(df["Day"], errors="coerce")
+    return df
+
+def summarize_repo(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["Window","BetType","Picks","Graded","Wins","Losses","Pushes","Win%"])
+    now = pd.Timestamp.now()
+    today = now.normalize()
+    week_start = today - pd.Timedelta(days=today.weekday())
+    month_start = today.replace(day=1)
+
+    def window_df(label, start):
+        x = df[df["Day_dt"] >= start].copy()
+        if x.empty:
+            return None
+        x["Picks"] = 1
+        x["Graded"] = (x["Status"] == "Graded").astype(int)
+        x["Wins"] = (x["Result"] == "W").astype(int)
+        x["Losses"] = (x["Result"] == "L").astype(int)
+        x["Pushes"] = (x["Result"] == "P").astype(int)
+        agg = x.groupby(["BetType"], dropna=False).agg(
+            Picks=("Picks","sum"),
+            Graded=("Graded","sum"),
+            Wins=("Wins","sum"),
+            Losses=("Losses","sum"),
+            Pushes=("Pushes","sum"),
+        ).reset_index()
+        denom = (agg["Wins"] + agg["Losses"]).replace(0, np.nan)
+        agg["Win%"] = ((agg["Wins"] / denom) * 100.0).round(1).fillna(0.0)
+        agg.insert(0, "Window", label)
+        return agg
+
+    parts = []
+    for label, start in [("Today", today), ("This Week", week_start), ("This Month", month_start)]:
+        p = window_df(label, start)
+        if p is not None:
+            parts.append(p)
+    if not parts:
+        return pd.DataFrame(columns=["Window","BetType","Picks","Graded","Wins","Losses","Pushes","Win%"])
+    return pd.concat(parts, ignore_index=True)
+
+# =========================================================
+# Team Context (best-effort, safe; does not affect pick math)
+# Uses ESPN public endpoints when available.
+# =========================================================
+ESPN = "https://site.api.espn.com/apis/site/v2/sports"
+
+@st.cache_data(ttl=60 * 60 * 6)
+def espn_team_records_nfl():
+    # standings endpoint can change; keep defensive
+    url = f"{ESPN}/football/nfl/standings"
+    ok, status, payload, final_url = safe_get(url, params=None, timeout=25)
+    if not ok or not isinstance(payload, dict):
+        return {}
+    # attempt parse: payload["children"][...]["standings"]["entries"]
+    out = {}
+    try:
+        for conf in payload.get("children", []) or []:
+            for div in conf.get("children", []) or []:
+                for e in (div.get("standings", {}) or {}).get("entries", []) or []:
+                    team = (((e.get("team") or {}).get("displayName")) or "").strip()
+                    if not team:
+                        continue
+                    # records list contains items with "type": "total", "home", "away" etc
+                    recs = {}
+                    for r in e.get("stats", []) or []:
+                        # stats list often includes "name":"overall","value": etc — not stable
+                        pass
+                    # Better: use e["records"] if present (often present in other ESPN schemas)
+                    for rr in e.get("records", []) or []:
+                        rtype = rr.get("type")
+                        summ = rr.get("summary")
+                        if rtype and summ:
+                            recs[rtype] = summ
+                    out[team] = recs
+    except Exception:
+        return out
+    return out
+
+def _team_context_row(event_str: str, sport: str):
+    # Currently best-effort only for NFL via ESPN standings
+    away, home = _parse_event_teams(event_str)
+    if sport != "NFL":
+        return {}
+    recs = espn_team_records_nfl()
+    return {
+        "AwayTeam": away,
+        "HomeTeam": home,
+        "AwayRec": (recs.get(away, {}) or {}).get("total", ""),
+        "HomeRec": (recs.get(home, {}) or {}).get("total", ""),
+        "AwayHomeSplit": (recs.get(away, {}) or {}).get("home", ""),
+        "AwayAwaySplit": (recs.get(away, {}) or {}).get("away", ""),
+        "HomeHomeSplit": (recs.get(home, {}) or {}).get("home", ""),
+        "HomeAwaySplit": (recs.get(home, {}) or {}).get("away", ""),
+        # ATS is not reliably available from ESPN standings; leave blank (avoid false data)
+        "AwayATS": "",
+        "HomeATS": "",
+        "AwayRank": "",
+        "HomeRank": "",
+        "AwayL5_SU": "",
+        "HomeL5_SU": "",
+    }
+
+# =========================================================
+# UFC Module (fail-safe; never blocks app)
+# Uses UFCStats first; if blocked, shows clean message.
+# =========================================================
+UFCSTATS_EVENTS = "http://ufcstats.com/statistics/events/upcoming"
+
+def ufc_render():
+    card_open()
+    st.subheader("UFC — Fight Picks (best-effort)")
+    st.caption("This module is isolated: if UFCStats is blocked/changes, it won’t affect other modules.")
+
+    ok, status, html, final_url = safe_get_text(UFCSTATS_EVENTS, timeout=20)
+    if not ok or not isinstance(html, str) or len(html) < 200:
+        st.warning("Could not load UFC upcoming events (UFCStats blocked or down).")
+        if debug:
+            st.json({"ufc_upcoming": {"ok": ok, "status": status, "url": final_url}})
+        card_close()
+        return
+
+    # No lxml usage; very simple parsing with string ops (robust enough to not crash)
+    # Find first event-details link
+    # UFCStats links look like: href="http://ufcstats.com/event-details/...."
+    ev_urls = []
+    parts = html.split('href="')
+    for p in parts[1:]:
+        u = p.split('"', 1)[0]
+        if "ufcstats.com/event-details/" in u:
+            ev_urls.append(u)
+    ev_urls = list(dict.fromkeys(ev_urls))  # unique preserve order
+
+    if not ev_urls:
+        st.warning("No UFC events found from UFCStats right now (site may be blocking or markup changed).")
+        if debug:
+            st.json({"hint": "No event-details links parsed from upcoming page."})
+        card_close()
+        return
+
+    selected = st.selectbox("Upcoming UFC events (UFCStats)", ev_urls, index=0, key="ufc_ev")
+    ok2, status2, ev_html, ev_url = safe_get_text(selected, timeout=20)
+    if not ok2 or not isinstance(ev_html, str) or len(ev_html) < 200:
+        st.warning("Could not load selected UFC event page.")
+        if debug:
+            st.json({"selected_event": {"ok": ok2, "status": status2, "url": ev_url}})
+        card_close()
+        return
+
+    # Fight rows have links to fight-details
+    fight_urls = []
+    for p in ev_html.split('href="')[1:]:
+        u = p.split('"', 1)[0]
+        if "ufcstats.com/fight-details/" in u:
+            fight_urls.append(u)
+    fight_urls = list(dict.fromkeys(fight_urls))
+
+    if not fight_urls:
+        st.warning("No fights parsed on this event page (HTML changed or blocked).")
+        if debug:
+            st.json({"selected_event_url": selected, "event_url": ev_url})
+        card_close()
+        return
+
+    # Minimal “best effort” picks: without reliable fighter stats (blocked scraping), we cannot compute your full metric model.
+    # So we show fight list and a neutral placeholder pick until a stable stats source is wired.
+    st.markdown("### Card (parsed)")
+    st.caption("If you want the full metric model (age/reach/stance/record + striking/takedowns), UFCStats must allow fighter pages. This app will not scrape aggressively (keeps site load safe).")
+
+    # Try parse fighter names from event HTML table rows
+    # UFCStats event table contains <td class="b-fight-details__table-col l-page_align_left"> with names inside <a>
+    names = []
+    for seg in ev_html.split('b-link b-link_style_black'):
+        if 'href="http://ufcstats.com/fighter-details/' in seg:
+            # name text after >
+            t = seg.split(">", 1)
+            if len(t) > 1:
+                nm = t[1].split("<", 1)[0].strip()
+                if nm:
+                    names.append(nm)
+    # crude pairing (names appear twice per fight)
+    fights = []
+    if len(names) >= 2:
+        for i in range(0, len(names) - 1, 2):
+            fights.append((names[i], names[i+1]))
+
+    if not fights:
+        st.info("Fight list found, but fighter names could not be parsed reliably from this page. Debug on for diagnostics.")
+        if debug:
+            st.json({"fight_urls_count": len(fight_urls)})
+        card_close()
+        return
+
+    rows = []
+    for a, b in fights[:15]:
+        # Placeholder heuristic: pick alphabetically earlier as “Pick” (NOT a real model)
+        # This is intentional to avoid fake “AI certainty” until stable stats source is available.
+        pick = a
+        rows.append({"Fighter A": a, "Fighter B": b, "Pick (placeholder)": pick, "Confidence": 0.50, "Notes": "Needs stable stats feed to compute model."})
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    if debug:
+        st.json({"ufc_event_url": selected, "fights_parsed": len(fights)})
 
     card_close()
 
-
 # =========================================================
-# MAIN
+# MAIN UI
 # =========================================================
-if mode == "Tracker":
-    render_tracker()
-    st.stop()
-
 if mode == "Game Lines":
     card_open()
 
@@ -1105,6 +1358,7 @@ if mode == "Game Lines":
     bet_type = st.selectbox("Bet Type", list(GAME_MARKETS.keys()), index=1, key="gl_bettype")
     top_n = st.slider("Top picks (ranked by EDGE)", 2, 10, 5, key="gl_topn")
     show_top25 = st.toggle("Show top 25 snapshot", value=True, key="gl_top25")
+    show_team_context = st.toggle("Show team context (best-effort)", value=True, key="gl_team_ctx")
 
     df_best, err = build_game_lines_board(sport, bet_type)
     if df_best.empty:
@@ -1116,7 +1370,7 @@ if mode == "Game Lines":
         df_best = apply_ai_enrichment(df_best, sport=sport, market=bet_type, max_rows=25)
 
     st.subheader(f"{sport} — {bet_type} (DK/FD) — STRICT no-contradictions")
-    st.caption("Strict rule: only ONE pick per game per market. Ranked by Edge. AI Assist adds notes only.")
+    st.caption("Strict rule: only ONE pick per game per market. Ranked by Edge. (Team context is additive only.)")
 
     top = df_best.head(int(top_n)).copy()
     top["⭐ BestBook"] = "⭐ " + top["BestBook"].astype(str)
@@ -1126,33 +1380,24 @@ if mode == "Game Lines":
         cols += ["LineBucket"]
     cols += ["BestPrice", "⭐ BestBook", "YourProb%", "Implied%", "Edge%", "EV"]
     if ai_on:
-        cols += ["AI_Label", "AI_Conf", "AI_Flags", "AI_Notes", "Edge_AI"]
+        cols += ["AI_Label", "AI_Conf", "AI_Flags", "AI_Notes"]
     cols = [c for c in cols if c in top.columns]
-    st.dataframe(top[cols], use_container_width=True, hide_index=True)
 
-    # ✅ Log Top Picks to Tracker (unchanged)
-    if st.button("Log these Top Picks to Tracker"):
-        rows = []
-        for _, r in top.iterrows():
-            rows.append({
-                "LoggedAt": datetime.now().isoformat(),
-                "Mode": "Game Lines",
-                "Sport": sport,
-                "Market": bet_type,
-                "Event": r.get("Event", ""),
-                "Selection": r.get("Outcome", ""),
-                "Line": r.get("LineBucket", ""),
-                "BestBook": r.get("BestBook", ""),
-                "BestPrice": r.get("BestPrice", ""),
-                "YourProb": r.get("YourProb", np.nan),
-                "Implied": r.get("ImpliedBest", np.nan),
-                "Edge": r.get("Edge", np.nan),
-                "EV": r.get("EV", np.nan),
-                "Status": "Pending",
-                "Result": "",
-            })
-        tracker_log_rows(rows)
-        st.success("Logged to Tracker ✅ (go to Tracker tab to grade/results).")
+    if show_team_context:
+        ctx_rows = []
+        for ev in top["Event"].astype(str).tolist():
+            ctx_rows.append(_team_context_row(ev, sport))
+        ctx = pd.DataFrame(ctx_rows)
+        if not ctx.empty:
+            # join by index order
+            top2 = top.reset_index(drop=True).copy()
+            ctx2 = ctx.reset_index(drop=True).copy()
+            view = pd.concat([top2[cols], ctx2], axis=1)
+            st.dataframe(view, use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(top[cols], use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(top[cols], use_container_width=True, hide_index=True)
 
     st.markdown("#### Probability view (Top Picks)")
     chart = top.copy()
@@ -1165,9 +1410,7 @@ if mode == "Game Lines":
     if show_top25:
         st.markdown("### Snapshot — Top 25 (sorted by Edge)")
         snap = df_best.head(25).copy()
-        snap["⭐ BestBook"] = "⭐ " + snap["BestBook"].astype(str)
-        cols2 = [c for c in cols if c in snap.columns]
-        st.dataframe(snap[cols2], use_container_width=True, hide_index=True)
+        st.dataframe(snap[cols], use_container_width=True, hide_index=True)
 
     card_close()
 
@@ -1190,7 +1433,7 @@ elif mode == "Player Props":
         df_best = apply_ai_enrichment(df_best, sport=sport, market=prop_label, max_rows=25)
 
     st.subheader(f"{sport} — Player Props ({prop_label}) — STRICT no-contradictions")
-    st.caption("Strict rule: only ONE pick per player per market per game. Ranked by Edge. AI Assist adds notes only.")
+    st.caption("Strict rule: only ONE pick per player per market per game. Ranked by Edge. AI adds notes only.")
 
     top = df_best.head(int(top_n)).copy()
     top["⭐ BestBook"] = "⭐ " + top["BestBook"].astype(str)
@@ -1200,34 +1443,10 @@ elif mode == "Player Props":
         cols += ["LineBucket"]
     cols += ["BestPrice", "⭐ BestBook", "YourProb%", "Implied%", "Edge%", "EV"]
     if ai_on:
-        cols += ["AI_Label", "AI_Conf", "AI_Flags", "AI_Notes", "Edge_AI"]
+        cols += ["AI_Label", "AI_Conf", "AI_Flags", "AI_Notes"]
     cols = [c for c in cols if c in top.columns]
-    st.dataframe(top[cols], use_container_width=True, hide_index=True)
 
-    # ✅ Log Top Picks to Tracker (unchanged)
-    if st.button("Log these Top Picks to Tracker", key="log_props"):
-        rows = []
-        for _, r in top.iterrows():
-            sel = f"{r.get('Player', '')} {r.get('Side', '')}".strip()
-            rows.append({
-                "LoggedAt": datetime.now().isoformat(),
-                "Mode": "Player Props",
-                "Sport": sport,
-                "Market": prop_label,
-                "Event": r.get("Event", ""),
-                "Selection": sel,
-                "Line": r.get("LineBucket", ""),
-                "BestBook": r.get("BestBook", ""),
-                "BestPrice": r.get("BestPrice", ""),
-                "YourProb": r.get("YourProb", np.nan),
-                "Implied": r.get("ImpliedBest", np.nan),
-                "Edge": r.get("Edge", np.nan),
-                "EV": r.get("EV", np.nan),
-                "Status": "Pending",
-                "Result": "",
-            })
-        tracker_log_rows(rows)
-        st.success("Logged to Tracker ✅ (go to Tracker tab to grade/results).")
+    st.dataframe(top[cols], use_container_width=True, hide_index=True)
 
     st.markdown("#### Probability view (Top Picks)")
     chart = top.copy()
@@ -1240,16 +1459,15 @@ elif mode == "Player Props":
     if show_top25:
         st.markdown("### Snapshot — Top 25 (sorted by Edge)")
         snap = df_best.head(25).copy()
-        cols2 = [c for c in cols if c in snap.columns]
-        st.dataframe(snap[cols2], use_container_width=True, hide_index=True)
+        st.dataframe(snap[cols], use_container_width=True, hide_index=True)
 
     card_close()
 
-else:
+elif mode == "PGA":
     card_open()
 
     if not DATAGOLF_API_KEY.strip():
-        st.warning('Missing DATAGOLF_KEY. Add it in Streamlit Secrets as DATAGOLF_KEY="..." (or DATAGOLF_API_KEY). PGA is hidden until then.')
+        st.warning('Missing DATAGOLF_KEY. Add it in Streamlit Secrets as DATAGOLF_KEY="..." (or DATAGOLF_API_KEY).')
         card_close()
         st.stop()
 
@@ -1258,9 +1476,6 @@ else:
 
     out, err = build_pga_board()
     if isinstance(out, dict) and "winners" in out:
-        if debug:
-            st.json({"dg_meta": out.get("meta", {})})
-
         winners = out["winners"]
         top10s = out["top10s"]
         oad = out["oad"]
@@ -1273,52 +1488,71 @@ else:
 
         st.markdown("### 🧳 Best One-and-Done Options (Top 7)")
         st.dataframe(oad, use_container_width=True, hide_index=True)
-
-        # ✅ Log PGA picks to Tracker (unchanged)
-        if st.button("Log PGA Top Picks to Tracker"):
-            rows = []
-            for _, r in winners.head(10).iterrows():
-                rows.append({
-                    "LoggedAt": datetime.now().isoformat(),
-                    "Mode": "PGA",
-                    "Sport": "PGA",
-                    "Market": "Win",
-                    "Event": out.get("meta", {}).get("event_name", ""),
-                    "Selection": r.get("Player", ""),
-                    "Line": "",
-                    "BestBook": "",
-                    "BestPrice": "",
-                    "YourProb": pd.to_numeric(r.get("WinProb", np.nan), errors="coerce"),
-                    "Implied": np.nan,
-                    "Edge": np.nan,
-                    "EV": np.nan,
-                    "Status": "Pending",
-                    "Result": "",
-                })
-            for _, r in top10s.head(10).iterrows():
-                rows.append({
-                    "LoggedAt": datetime.now().isoformat(),
-                    "Mode": "PGA",
-                    "Sport": "PGA",
-                    "Market": "Top 10",
-                    "Event": out.get("meta", {}).get("event_name", ""),
-                    "Selection": r.get("Player", ""),
-                    "Line": "",
-                    "BestBook": "",
-                    "BestPrice": "",
-                    "YourProb": pd.to_numeric(r.get("Top10Prob", np.nan), errors="coerce"),
-                    "Implied": np.nan,
-                    "Edge": np.nan,
-                    "EV": np.nan,
-                    "Status": "Pending",
-                    "Result": "",
-                })
-            tracker_log_rows(rows)
-            st.success("Logged PGA picks to Tracker ✅")
-
     else:
         st.warning(err.get("error", "No PGA data available right now."))
         if debug:
             st.json(err)
+
+    card_close()
+
+elif mode == "UFC":
+    ufc_render()
+
+else:
+    # RESULTS
+    card_open()
+    st.subheader("📊 Results Repository — Auto-graded Win/Loss (Daily/Weekly/Monthly)")
+    st.caption("Auto-snapshots top 10 Moneyline + top 10 Spreads per sport per day. Grades automatically from scores when games complete.")
+
+    repo = _load_results_repo()
+
+    # Auto-snapshot each sport once per day (safe)
+    created = 0
+    day_key = _today_key_local()
+    for sport in SPORT_KEYS_LINES.keys():
+        if _snapshot_exists(repo, day_key, sport):
+            continue
+        snap = _make_top10_snapshot_for_sport(sport)
+        if snap is not None:
+            repo["snapshots"].append(snap)
+            created += 1
+    if created > 0:
+        _save_results_repo(repo)
+
+    # Auto-grade from scores
+    repo, diag = grade_repo_from_scores(repo, days_from=14)
+    _save_results_repo(repo)
+
+    if debug:
+        st.json({"repo_diag": diag})
+
+    df = repo_items_df(repo)
+    if df.empty:
+        st.info("No snapshots yet (no eligible games/markets returned).")
+        card_close()
+        st.stop()
+
+    summary = summarize_repo(df)
+    st.markdown("### Summary")
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    st.markdown("### Latest Picks (Top 10 ML + Top 10 Spreads per sport)")
+    latest_day = df["Day_dt"].max()
+    show = df[df["Day_dt"] == latest_day].copy()
+    show = show.sort_values(["Sport", "BetType", "Edge"], ascending=[True, True, False])
+
+    # Add team context columns (best-effort)
+    ctx_rows = []
+    for _, r in show.iterrows():
+        ctx_rows.append(_team_context_row(r.get("Event",""), r.get("Sport","")))
+    ctx = pd.DataFrame(ctx_rows)
+    if not ctx.empty:
+        show2 = show.reset_index(drop=True)
+        ctx2 = ctx.reset_index(drop=True)
+        view = pd.concat([show2.drop(columns=["Day_dt"], errors="ignore"), ctx2], axis=1)
+    else:
+        view = show.drop(columns=["Day_dt"], errors="ignore")
+
+    st.dataframe(view, use_container_width=True, hide_index=True)
 
     card_close()

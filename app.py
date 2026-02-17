@@ -1,8 +1,3 @@
-# app.py — EdgeLedger (premium wrapper + your working core) + ESPN rank/record enrichment for Game Lines
-# NOTE: This is a single-file, copy/paste-ready app.py.
-# It keeps your existing logic intact and ONLY adds ESPN team context enrichment for Game Lines.
-# (Tracker remains as in your working version.)
-
 import os
 import time
 from datetime import datetime
@@ -51,13 +46,13 @@ div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
   canvas, svg, img { max-width: 100% !important; height: auto !important; }
 
   /* radio buttons: bigger tap targets */
-  div[role="radiogroup"] label { 
-    padding: 10px 10px !important; 
+  div[role="radiogroup"] label {
+    padding: 10px 10px !important;
     margin: 6px 0 !important;
     border-radius: 12px !important;
   }
-  div[role="radiogroup"] label p { 
-    font-size: 1.05rem !important; 
+  div[role="radiogroup"] label p {
+    font-size: 1.05rem !important;
     font-weight: 700 !important;
   }
 }
@@ -258,7 +253,10 @@ PROP_MARKETS = {
 }
 
 # =========================================================
-# ESPN Team Context Enrichment (NEW - safe, read-only)
+# ESPN Team Context Enrichment (FIXED: uses STANDINGS)
+# Populates overall + home/away splits reliably.
+# Rank is included when ESPN provides it (otherwise blank).
+# ATS is not provided by ESPN site API; kept as blank placeholders.
 # =========================================================
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
 
@@ -271,74 +269,134 @@ def _espn_sport_path_for_lines(sport: str) -> str:
         return "basketball/mens-college-basketball"
     return ""
 
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
-def espn_fetch_teams_index(sport: str) -> dict:
-    sp = _espn_sport_path_for_lines(sport)
-    if not sp:
-        return {}
-    url = f"{ESPN_BASE}/{sp}/teams"
-    ok, status, payload, final_url = safe_get(url, params=None, timeout=25)
-    if not ok or not isinstance(payload, dict):
-        return {}
-
-    teams = {}
-    try:
-        league = payload.get("sports", [{}])[0].get("leagues", [{}])[0]
-        for t in (league.get("teams", []) or []):
-            team = (t or {}).get("team", {}) or {}
-            name = str(team.get("displayName", "")).strip()
-            if not name:
-                continue
-            key = " ".join(name.lower().split())
-            teams[key] = team
-    except Exception:
-        return {}
-    return teams
-
-@st.cache_data(ttl=60 * 60 * 3, show_spinner=False)
-def espn_fetch_team_detail(sport: str, team_id: str) -> dict:
-    sp = _espn_sport_path_for_lines(sport)
-    if not sp or not team_id:
-        return {}
-    url = f"{ESPN_BASE}/{sp}/teams/{team_id}"
-    ok, status, payload, final_url = safe_get(url, params=None, timeout=25)
-    if not ok or not isinstance(payload, dict):
-        return {}
-    return payload
-
-def _pick_record_strings(team_payload: dict) -> dict:
-    overall = home = away = ""
-
-    overall = str(team_payload.get("team", {}).get("recordSummary") or team_payload.get("recordSummary") or "").strip()
-
-    rec = team_payload.get("team", {}).get("record") or team_payload.get("record") or {}
-    items = rec.get("items") if isinstance(rec, dict) else None
-
-    if isinstance(items, list):
-        for it in items:
-            typ = str((it or {}).get("type", "")).lower()
-            nm = str((it or {}).get("name", "")).lower()
-            summ = str((it or {}).get("summary", "")).strip()
-            if not summ:
-                continue
-            if ("overall" in typ) or ("overall" in nm):
-                overall = overall or summ
-            if ("home" in typ) or ("home" in nm):
-                home = home or summ
-            if ("road" in typ) or ("away" in nm) or ("road" in nm):
-                away = away or summ
-
-    return {"overall": overall, "home": home, "away": away}
-
 def _normalize_team_name(name: str) -> str:
     return " ".join(str(name or "").strip().lower().split())
 
-def enrich_game_lines_with_team_context(df_best: pd.DataFrame, sport: str) -> pd.DataFrame:
+def _safe_str(x) -> str:
+    return "" if x is None else str(x).strip()
+
+def _stat_map(entry: dict) -> dict:
+    out = {}
+    for s in (entry.get("stats", []) or []):
+        nm = str((s or {}).get("name", "")).strip()
+        if nm:
+            out[nm] = s
+    return out
+
+@st.cache_data(ttl=60 * 60 * 3, show_spinner=False)
+def espn_fetch_standings_map(sport: str, debug: bool = False) -> dict:
+    sp = _espn_sport_path_for_lines(sport)
+    if not sp:
+        return {}
+
+    url = f"{ESPN_BASE}/{sp}/standings"
+    ok, status, payload, final_url = safe_get(url, params=None, timeout=25)
+    if debug:
+        st.json({"espn_standings_call": {"ok": ok, "status": status, "url": final_url}})
+
+    if not ok or not isinstance(payload, dict):
+        return {}
+
+    entries = []
+    try:
+        league = payload.get("sports", [{}])[0].get("leagues", [{}])[0]
+        standings = league.get("standings", {}) or {}
+        entries = standings.get("entries", []) or []
+    except Exception:
+        entries = []
+
+    if not isinstance(entries, list) or not entries:
+        return {}
+
+    m = {}
+    for e in entries:
+        team = (e or {}).get("team", {}) or {}
+        display = _safe_str(team.get("displayName") or team.get("shortDisplayName") or team.get("name"))
+        if not display:
+            continue
+
+        team_id = _safe_str(team.get("id"))
+        key = _normalize_team_name(display)
+
+        sm = _stat_map(e)
+
+        wins = sm.get("wins", {}).get("value")
+        losses = sm.get("losses", {}).get("value")
+        overall = ""
+        try:
+            if wins is not None and losses is not None:
+                overall = f"{int(wins)}-{int(losses)}"
+        except Exception:
+            overall = ""
+
+        home = _safe_str(sm.get("home", {}).get("summary") or sm.get("home", {}).get("displayValue"))
+        away = _safe_str(
+            sm.get("away", {}).get("summary") or sm.get("away", {}).get("displayValue")
+            or sm.get("road", {}).get("summary") or sm.get("road", {}).get("displayValue")
+        )
+
+        rank = _safe_str(
+            sm.get("rank", {}).get("value")
+            or sm.get("seed", {}).get("value")
+            or sm.get("playoffSeed", {}).get("value")
+        )
+
+        base = {
+            "TeamId": team_id,
+            "Display": display,
+            "Rank": rank,
+            "Overall": overall,
+            "Home": home,
+            "Away": away,
+        }
+        m[key] = base
+
+        # Aliases to reduce mismatches
+        abbr = _safe_str(team.get("abbreviation"))
+        short = _safe_str(team.get("shortDisplayName"))
+        loc = _safe_str(team.get("location"))
+        nick = _safe_str(team.get("nickname"))
+        name2 = _safe_str(team.get("name"))
+
+        for alias in [abbr, short, loc, nick, name2]:
+            akey = _normalize_team_name(alias)
+            if akey and akey not in m:
+                m[akey] = base
+
+        if loc and nick:
+            akey = _normalize_team_name(f"{loc} {nick}")
+            if akey and akey not in m:
+                m[akey] = base
+
+    return m
+
+def _match_team_key(name: str, standings_map: dict) -> str:
+    n = _normalize_team_name(name)
+    if not n:
+        return ""
+    if n in standings_map:
+        return n
+
+    n2 = (
+        n.replace(".", "")
+         .replace(",", "")
+         .replace("st ", "saint ")
+         .replace("st.", "saint ")
+    )
+    if n2 in standings_map:
+        return n2
+
+    for k in standings_map.keys():
+        if k and (k in n2 or n2 in k):
+            return k
+    return ""
+
+def enrich_game_lines_with_team_context(df_best: pd.DataFrame, sport: str, debug_flag: bool = False) -> pd.DataFrame:
     if df_best.empty or "Event" not in df_best.columns:
         return df_best
 
-    teams_index = espn_fetch_teams_index(sport)
-    if not teams_index:
+    standings_map = espn_fetch_standings_map(sport, debug=debug_flag)
+    if not standings_map:
         return df_best
 
     out = df_best.copy()
@@ -361,49 +419,30 @@ def enrich_game_lines_with_team_context(df_best: pd.DataFrame, sport: str) -> pd
         except Exception:
             return "", ""
 
-    memo = {}
-
     for idx, r in out.iterrows():
         away_name, home_name = parse_matchup(r.get("Event", ""))
-        away_key = _normalize_team_name(away_name)
-        home_key = _normalize_team_name(home_name)
 
-        def get_team_info(team_key: str):
-            if not team_key or team_key not in teams_index:
-                return {}
-            team_id = str(teams_index[team_key].get("id", "")).strip()
-            if not team_id:
-                return {}
-            mk = (sport, team_id)
-            if mk in memo:
-                return memo[mk]
+        ak = _match_team_key(away_name, standings_map)
+        hk = _match_team_key(home_name, standings_map)
 
-            detail = espn_fetch_team_detail(sport, team_id)
-            recs = _pick_record_strings(detail)
-            info = {
-                "record": recs.get("overall", ""),
-                "home": recs.get("home", ""),
-                "away": recs.get("away", ""),
-                "rank": "",  # left blank (college poll rank requires a separate endpoint; NFL has no poll rank)
-            }
-            memo[mk] = info
-            return info
+        a = standings_map.get(ak, {}) if ak else {}
+        h = standings_map.get(hk, {}) if hk else {}
 
-        a = get_team_info(away_key)
-        h = get_team_info(home_key)
+        out.at[idx, "AwayRank"] = _safe_str(a.get("Rank", ""))
+        out.at[idx, "HomeRank"] = _safe_str(h.get("Rank", ""))
 
-        out.at[idx, "AwayRecord"] = a.get("record", "")
-        out.at[idx, "HomeRecord"] = h.get("record", "")
+        out.at[idx, "AwayRecord"] = _safe_str(a.get("Overall", ""))
+        out.at[idx, "HomeRecord"] = _safe_str(h.get("Overall", ""))
 
-        a_split = " / ".join([x for x in [a.get("home", ""), a.get("away", "")] if x])
-        h_split = " / ".join([x for x in [h.get("home", ""), h.get("away", "")] if x])
-        out.at[idx, "AwaySplit"] = a_split
-        out.at[idx, "HomeSplit"] = h_split
+        a_home = _safe_str(a.get("Home", ""))
+        a_away = _safe_str(a.get("Away", ""))
+        h_home = _safe_str(h.get("Home", ""))
+        h_away = _safe_str(h.get("Away", ""))
 
-        out.at[idx, "AwayRank"] = a.get("rank", "")
-        out.at[idx, "HomeRank"] = h.get("rank", "")
+        out.at[idx, "AwaySplit"] = " / ".join([x for x in [f"Home {a_home}" if a_home else "", f"Away {a_away}" if a_away else ""] if x])
+        out.at[idx, "HomeSplit"] = " / ".join([x for x in [f"Home {h_home}" if h_home else "", f"Away {h_away}" if h_away else ""] if x])
 
-        # ATS placeholders (safe)
+        # ATS placeholders (not available via ESPN site standings)
         out.at[idx, "AwayATS"] = out.at[idx, "AwayATS"] or ""
         out.at[idx, "HomeATS"] = out.at[idx, "HomeATS"] or ""
         out.at[idx, "AwayLast5ATS"] = out.at[idx, "AwayLast5ATS"] or ""
@@ -541,7 +580,7 @@ def normalize_props(event_payload):
             mkey = mk.get("key")
             for out in (mk.get("outcomes", []) or []):
                 player = out.get("name")
-                side = out.get("description")  # Over/Under usually; may be blank
+                side = out.get("description")
                 line = out.get("point")
                 price = out.get("price")
 
@@ -686,6 +725,10 @@ def build_game_lines_board(sport: str, bet_type: str):
     df_best = filter_value(df_best, show_non_value=show_non_value)
     df_best = decorate_probs(df_best)
     df_best = df_best.sort_values("Edge", ascending=False)
+
+    # ✅ NEW: add rank/record/splits from ESPN standings (populates columns)
+    df_best = enrich_game_lines_with_team_context(df_best, sport=sport, debug_flag=debug)
+
     return df_best, {}
 
 def build_props_board(sport: str, prop_label: str, max_events_scan: int = 8):
@@ -787,6 +830,14 @@ def _dg_find_rows(payload):
             if len(rows) == 0 or isinstance(rows[0], dict):
                 return rows, meta
 
+    prefer = ["baseline_history_fit", "baseline", "sg_total", "default"]
+    for p in prefer:
+        if p in payload and isinstance(payload[p], list):
+            rows = payload[p]
+            if len(rows) == 0 or isinstance(rows[0], dict):
+                meta["model_used"] = p
+                return rows, meta
+
     for k, v in payload.items():
         if isinstance(v, list) and (len(v) == 0 or isinstance(v[0], dict)):
             meta["model_used"] = k
@@ -847,7 +898,6 @@ def build_pga_board():
         return pd.DataFrame(), {"error": "No PGA prediction rows returned from DataGolf (parsed none).", "dg_meta": meta}
 
     df_pre = pd.DataFrame(pre_rows)
-
     name_col = _first_col(df_pre, ["player_name", "name", "golfer", "player"])
     if not name_col:
         return pd.DataFrame(), {"error": "Could not find player name column in DataGolf pre-tournament payload."}
@@ -1034,28 +1084,29 @@ if mode == "Game Lines":
     bet_type = st.selectbox("Bet Type", list(GAME_MARKETS.keys()), index=1, key="gl_bettype")
     top_n = st.slider("Top picks (ranked by EDGE)", 2, 10, 5, key="gl_topn")
     show_top25 = st.toggle("Show top 25 snapshot", value=True, key="gl_top25")
+    show_team_context = st.toggle("Show team rank/record/splits", value=True, key="gl_team_ctx")
 
     df_best, err = build_game_lines_board(sport, bet_type)
     if df_best.empty:
         st.warning(err.get("error", "No game lines available."))
         st.stop()
 
-    # NEW: enrich with ESPN records/splits (rank placeholders included)
-    df_best = enrich_game_lines_with_team_context(df_best, sport=sport)
-
     st.subheader(f"{sport} — {bet_type} (DK/FD) — STRICT no-contradictions")
-    st.caption("Strict rule: only ONE pick per game per market (even across different lines). Ranked by Edge. Records from ESPN.")
+    st.caption("Strict rule: only ONE pick per game per market (even across different lines). Ranked by Edge.")
 
     top = df_best.head(int(top_n)).copy()
     top["⭐ BestBook"] = "⭐ " + top["BestBook"].astype(str)
 
-    cols = ["Event", "AwayRank", "AwayRecord", "AwaySplit", "HomeRank", "HomeRecord", "HomeSplit", "Outcome"] + \
-           (["LineBucket"] if "LineBucket" in top.columns and top["LineBucket"].notna().any() else []) + \
-           ["BestPrice", "⭐ BestBook", "YourProb%", "Implied%", "Edge%", "EV", "AwayATS", "AwayLast5ATS", "HomeATS", "HomeLast5ATS"]
+    cols = ["Event", "Outcome"]
+    if show_team_context:
+        cols += ["AwayRank", "AwayRecord", "AwaySplit", "HomeRank", "HomeRecord", "HomeSplit"]
+    if "LineBucket" in top.columns and top["LineBucket"].notna().any():
+        cols += ["LineBucket"]
+    cols += ["BestPrice", "⭐ BestBook", "YourProb%", "Implied%", "Edge%", "EV"]
+
     cols = [c for c in cols if c in top.columns]
     st.dataframe(top[cols], use_container_width=True, hide_index=True)
 
-    # Log Top Picks to Tracker
     if st.button("Log these Top Picks to Tracker"):
         rows = []
         for _, r in top.iterrows():
@@ -1089,7 +1140,12 @@ if mode == "Game Lines":
         st.markdown("### Snapshot — Top 25 (sorted by Edge)")
         snap = df_best.head(25).copy()
         snap["⭐ BestBook"] = "⭐ " + snap["BestBook"].astype(str)
-        cols2 = cols
+        cols2 = ["Event", "Outcome"]
+        if show_team_context:
+            cols2 += ["AwayRank", "AwayRecord", "AwaySplit", "HomeRank", "HomeRecord", "HomeSplit"]
+        if "LineBucket" in snap.columns and snap["LineBucket"].notna().any():
+            cols2 += ["LineBucket"]
+        cols2 += ["BestPrice", "⭐ BestBook", "YourProb%", "Implied%", "Edge%", "EV"]
         cols2 = [c for c in cols2 if c in snap.columns]
         st.dataframe(snap[cols2], use_container_width=True, hide_index=True)
 
@@ -1115,8 +1171,10 @@ elif mode == "Player Props":
     top = df_best.head(int(top_n)).copy()
     top["⭐ BestBook"] = "⭐ " + top["BestBook"].astype(str)
 
-    cols = ["Event", "Player", "Side"] + (["LineBucket"] if "LineBucket" in top.columns and top["LineBucket"].notna().any() else []) + \
-           ["BestPrice", "⭐ BestBook", "YourProb%", "Implied%", "Edge%", "EV"]
+    cols = ["Event", "Player", "Side"]
+    if "LineBucket" in top.columns and top["LineBucket"].notna().any():
+        cols += ["LineBucket"]
+    cols += ["BestPrice", "⭐ BestBook", "YourProb%", "Implied%", "Edge%", "EV"]
     cols = [c for c in cols if c in top.columns]
     st.dataframe(top[cols], use_container_width=True, hide_index=True)
 
@@ -1154,8 +1212,10 @@ elif mode == "Player Props":
         st.markdown("### Snapshot — Top 25 (sorted by Edge)")
         snap = df_best.head(25).copy()
         snap["⭐ BestBook"] = "⭐ " + snap["BestBook"].astype(str)
-        cols2 = ["Event", "Player", "Side"] + (["LineBucket"] if "LineBucket" in snap.columns and snap["LineBucket"].notna().any() else []) + \
-                ["BestPrice", "⭐ BestBook", "YourProb%", "Implied%", "Edge%", "EV"]
+        cols2 = ["Event", "Player", "Side"]
+        if "LineBucket" in snap.columns and snap["LineBucket"].notna().any():
+            cols2 += ["LineBucket"]
+        cols2 += ["BestPrice", "⭐ BestBook", "YourProb%", "Implied%", "Edge%", "EV"]
         cols2 = [c for c in cols2 if c in snap.columns]
         st.dataframe(snap[cols2], use_container_width=True, hide_index=True)
 

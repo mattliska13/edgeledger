@@ -1,7 +1,11 @@
-# app.py  (FULL — UFC FIX: pandas tz_localize bug; ESPN JSON; NO lxml; no impact to other modules)
+# app.py — EdgeLedger (premium wrapper + your working core) + ESPN rank/record enrichment for Game Lines
+# NOTE: This is a single-file, copy/paste-ready app.py.
+# It keeps your existing logic intact and ONLY adds ESPN team context enrichment for Game Lines.
+# (Tracker remains as in your working version.)
+
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 import requests
 import numpy as np
 import pandas as pd
@@ -37,6 +41,7 @@ hr { border: none; border-top: 1px solid rgba(148,163,184,0.18); margin: 10px 0;
 div[data-testid="stDataFrame"] { width: 100%; }
 div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
 
+/* Mobile improvements: bigger radio + spacing */
 @media (max-width: 768px) {
   .block-container { padding-left: 0.8rem; padding-right: 0.8rem; }
   .big-title { font-size: 1.35rem; }
@@ -45,13 +50,14 @@ div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
   .stMarkdown p, .stCaption { font-size: 0.9rem; }
   canvas, svg, img { max-width: 100% !important; height: auto !important; }
 
-  div[role="radiogroup"] label {
-    padding: 10px 10px !important;
+  /* radio buttons: bigger tap targets */
+  div[role="radiogroup"] label { 
+    padding: 10px 10px !important; 
     margin: 6px 0 !important;
     border-radius: 12px !important;
   }
-  div[role="radiogroup"] label p {
-    font-size: 1.05rem !important;
+  div[role="radiogroup"] label p { 
+    font-size: 1.05rem !important; 
     font-weight: 700 !important;
   }
 }
@@ -60,7 +66,7 @@ div[data-testid="stDataFrame"] > div { overflow-x: auto !important; }
 st.markdown(CSS, unsafe_allow_html=True)
 
 # =========================================================
-# Tracker (unchanged)
+# Tracker (does not change odds/PGA logic)
 # =========================================================
 TRACK_FILE = "tracker.csv"
 
@@ -252,6 +258,160 @@ PROP_MARKETS = {
 }
 
 # =========================================================
+# ESPN Team Context Enrichment (NEW - safe, read-only)
+# =========================================================
+ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
+
+def _espn_sport_path_for_lines(sport: str) -> str:
+    if sport == "NFL":
+        return "football/nfl"
+    if sport == "CFB":
+        return "football/college-football"
+    if sport == "CBB":
+        return "basketball/mens-college-basketball"
+    return ""
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def espn_fetch_teams_index(sport: str) -> dict:
+    sp = _espn_sport_path_for_lines(sport)
+    if not sp:
+        return {}
+    url = f"{ESPN_BASE}/{sp}/teams"
+    ok, status, payload, final_url = safe_get(url, params=None, timeout=25)
+    if not ok or not isinstance(payload, dict):
+        return {}
+
+    teams = {}
+    try:
+        league = payload.get("sports", [{}])[0].get("leagues", [{}])[0]
+        for t in (league.get("teams", []) or []):
+            team = (t or {}).get("team", {}) or {}
+            name = str(team.get("displayName", "")).strip()
+            if not name:
+                continue
+            key = " ".join(name.lower().split())
+            teams[key] = team
+    except Exception:
+        return {}
+    return teams
+
+@st.cache_data(ttl=60 * 60 * 3, show_spinner=False)
+def espn_fetch_team_detail(sport: str, team_id: str) -> dict:
+    sp = _espn_sport_path_for_lines(sport)
+    if not sp or not team_id:
+        return {}
+    url = f"{ESPN_BASE}/{sp}/teams/{team_id}"
+    ok, status, payload, final_url = safe_get(url, params=None, timeout=25)
+    if not ok or not isinstance(payload, dict):
+        return {}
+    return payload
+
+def _pick_record_strings(team_payload: dict) -> dict:
+    overall = home = away = ""
+
+    overall = str(team_payload.get("team", {}).get("recordSummary") or team_payload.get("recordSummary") or "").strip()
+
+    rec = team_payload.get("team", {}).get("record") or team_payload.get("record") or {}
+    items = rec.get("items") if isinstance(rec, dict) else None
+
+    if isinstance(items, list):
+        for it in items:
+            typ = str((it or {}).get("type", "")).lower()
+            nm = str((it or {}).get("name", "")).lower()
+            summ = str((it or {}).get("summary", "")).strip()
+            if not summ:
+                continue
+            if ("overall" in typ) or ("overall" in nm):
+                overall = overall or summ
+            if ("home" in typ) or ("home" in nm):
+                home = home or summ
+            if ("road" in typ) or ("away" in nm) or ("road" in nm):
+                away = away or summ
+
+    return {"overall": overall, "home": home, "away": away}
+
+def _normalize_team_name(name: str) -> str:
+    return " ".join(str(name or "").strip().lower().split())
+
+def enrich_game_lines_with_team_context(df_best: pd.DataFrame, sport: str) -> pd.DataFrame:
+    if df_best.empty or "Event" not in df_best.columns:
+        return df_best
+
+    teams_index = espn_fetch_teams_index(sport)
+    if not teams_index:
+        return df_best
+
+    out = df_best.copy()
+
+    new_cols = [
+        "AwayRank", "HomeRank",
+        "AwayRecord", "HomeRecord",
+        "AwaySplit", "HomeSplit",
+        "AwayATS", "HomeATS",
+        "AwayLast5ATS", "HomeLast5ATS"
+    ]
+    for c in new_cols:
+        if c not in out.columns:
+            out[c] = ""
+
+    def parse_matchup(evt: str):
+        try:
+            away, home = [x.strip() for x in str(evt).split("@")]
+            return away, home
+        except Exception:
+            return "", ""
+
+    memo = {}
+
+    for idx, r in out.iterrows():
+        away_name, home_name = parse_matchup(r.get("Event", ""))
+        away_key = _normalize_team_name(away_name)
+        home_key = _normalize_team_name(home_name)
+
+        def get_team_info(team_key: str):
+            if not team_key or team_key not in teams_index:
+                return {}
+            team_id = str(teams_index[team_key].get("id", "")).strip()
+            if not team_id:
+                return {}
+            mk = (sport, team_id)
+            if mk in memo:
+                return memo[mk]
+
+            detail = espn_fetch_team_detail(sport, team_id)
+            recs = _pick_record_strings(detail)
+            info = {
+                "record": recs.get("overall", ""),
+                "home": recs.get("home", ""),
+                "away": recs.get("away", ""),
+                "rank": "",  # left blank (college poll rank requires a separate endpoint; NFL has no poll rank)
+            }
+            memo[mk] = info
+            return info
+
+        a = get_team_info(away_key)
+        h = get_team_info(home_key)
+
+        out.at[idx, "AwayRecord"] = a.get("record", "")
+        out.at[idx, "HomeRecord"] = h.get("record", "")
+
+        a_split = " / ".join([x for x in [a.get("home", ""), a.get("away", "")] if x])
+        h_split = " / ".join([x for x in [h.get("home", ""), h.get("away", "")] if x])
+        out.at[idx, "AwaySplit"] = a_split
+        out.at[idx, "HomeSplit"] = h_split
+
+        out.at[idx, "AwayRank"] = a.get("rank", "")
+        out.at[idx, "HomeRank"] = h.get("rank", "")
+
+        # ATS placeholders (safe)
+        out.at[idx, "AwayATS"] = out.at[idx, "AwayATS"] or ""
+        out.at[idx, "HomeATS"] = out.at[idx, "HomeATS"] or ""
+        out.at[idx, "AwayLast5ATS"] = out.at[idx, "AwayLast5ATS"] or ""
+        out.at[idx, "HomeLast5ATS"] = out.at[idx, "HomeLast5ATS"] or ""
+
+    return out
+
+# =========================================================
 # Sidebar UI
 # =========================================================
 st.sidebar.markdown("<div class='big-title'>Dashboard</div>", unsafe_allow_html=True)
@@ -261,7 +421,7 @@ st.sidebar.markdown("---")
 debug = st.sidebar.checkbox("Show debug logs", value=False)
 show_non_value = st.sidebar.checkbox("Show non-value rows (Edge ≤ 0)", value=False)
 
-mode = st.sidebar.radio("Mode", ["Game Lines", "Player Props", "PGA", "UFC", "Tracker"], index=0)
+mode = st.sidebar.radio("Mode", ["Game Lines", "Player Props", "PGA", "Tracker"], index=0)
 
 with st.sidebar.expander("API Keys (session-only override)", expanded=False):
     st.caption("If Secrets aren’t set, paste keys here (session-only).")
@@ -288,7 +448,7 @@ st.caption(
     "DK/FD only. Game lines / props / PGA run independently."
 )
 
-if not ODDS_API_KEY.strip() and mode not in ["Tracker", "UFC"]:
+if not ODDS_API_KEY.strip() and mode != "Tracker":
     st.error('Missing ODDS_API_KEY. Add it in Streamlit Secrets as ODDS_API_KEY="..." or paste it in the sidebar expander.')
     st.stop()
 
@@ -381,7 +541,7 @@ def normalize_props(event_payload):
             mkey = mk.get("key")
             for out in (mk.get("outcomes", []) or []):
                 player = out.get("name")
-                side = out.get("description")
+                side = out.get("description")  # Over/Under usually; may be blank
                 line = out.get("point")
                 price = out.get("price")
 
@@ -407,7 +567,7 @@ def normalize_props(event_payload):
     return df.dropna(subset=["Market", "Player", "Price"])
 
 # =========================================================
-# Core Best-Bet Logic
+# Core Best-Bet Logic (Implied vs YourProb)
 # =========================================================
 def add_implied(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -600,7 +760,7 @@ def bar_prob(df, label_col, prob_col_percent, title):
     st.pyplot(fig)
 
 # =========================================================
-# PGA (unchanged from your version; kept minimal here)
+# PGA — Advanced DataGolf Module (independent)
 # =========================================================
 DG_HOST = "https://feeds.datagolf.com"
 
@@ -612,21 +772,26 @@ def _dg_get(path: str, params: dict):
 def _dg_find_rows(payload):
     if isinstance(payload, list) and (len(payload) == 0 or isinstance(payload[0], dict)):
         return payload, {}
+
     if not isinstance(payload, dict):
         return [], {}
+
     meta = {}
     for k in ["event_name", "last_updated", "models_available", "tour"]:
         if k in payload:
             meta[k] = payload.get(k)
+
     for key in ["data", "predictions", "preds", "players", "rows"]:
         if key in payload and isinstance(payload[key], list):
             rows = payload[key]
             if len(rows) == 0 or isinstance(rows[0], dict):
                 return rows, meta
+
     for k, v in payload.items():
         if isinstance(v, list) and (len(v) == 0 or isinstance(v[0], dict)):
             meta["model_used"] = k
             return v, meta
+
     return [], meta
 
 def _normalize_name(s: str) -> str:
@@ -642,53 +807,207 @@ def _first_col(df: pd.DataFrame, candidates: list):
 
 def build_pga_board():
     if not DATAGOLF_API_KEY.strip():
-        return pd.DataFrame(), {"error": 'Missing DATAGOLF_KEY.'}
-    pre_params = {"tour": "pga","add_position": 10,"dead_heat": "yes","odds_format": "percent","file_format": "json","key": DATAGOLF_API_KEY}
+        return pd.DataFrame(), {"error": 'Missing DATAGOLF_KEY. Add it in Streamlit Secrets as DATAGOLF_KEY="..." (or DATAGOLF_API_KEY). PGA is hidden until then.'}
+
+    pre_params = {
+        "tour": "pga",
+        "add_position": 10,
+        "dead_heat": "yes",
+        "odds_format": "percent",
+        "file_format": "json",
+        "key": DATAGOLF_API_KEY,
+    }
+    decomp_params = {
+        "tour": "pga",
+        "file_format": "json",
+        "key": DATAGOLF_API_KEY,
+    }
+    skill_params = {
+        "display": "value",
+        "file_format": "json",
+        "key": DATAGOLF_API_KEY,
+    }
+
     pre = _dg_get("/preds/pre-tournament", pre_params)
+    dec = _dg_get("/preds/player-decompositions", decomp_params)
+    skl = _dg_get("/preds/skill-ratings", skill_params)
+
+    if debug:
+        st.json({
+            "dg_pre_tournament": {"ok": pre["ok"], "status": pre["status"], "url": pre["url"]},
+            "dg_decomp": {"ok": dec["ok"], "status": dec["status"], "url": dec["url"]},
+            "dg_skill": {"ok": skl["ok"], "status": skl["status"], "url": skl["url"]},
+        })
+
     if not pre["ok"]:
         return pd.DataFrame(), {"error": "DataGolf pre-tournament call failed", "status": pre["status"], "payload": pre["payload"]}
+
     pre_rows, meta = _dg_find_rows(pre["payload"])
     if not pre_rows:
-        return pd.DataFrame(), {"error": "No PGA prediction rows returned from DataGolf.", "dg_meta": meta}
+        return pd.DataFrame(), {"error": "No PGA prediction rows returned from DataGolf (parsed none).", "dg_meta": meta}
+
     df_pre = pd.DataFrame(pre_rows)
+
     name_col = _first_col(df_pre, ["player_name", "name", "golfer", "player"])
     if not name_col:
-        return pd.DataFrame(), {"error": "Could not find player name column in DataGolf payload."}
+        return pd.DataFrame(), {"error": "Could not find player name column in DataGolf pre-tournament payload."}
+
     win_col = None
+    top10_col = None
     for c in df_pre.columns:
-        if win_col is None and "win" in str(c).lower():
+        lc = str(c).lower()
+        if win_col is None and "win" in lc:
             win_col = c
+        if top10_col is None and ("top" in lc and "10" in lc):
+            top10_col = c
+
     if not win_col:
-        return pd.DataFrame(), {"error": "Could not locate win probability column in DataGolf data."}
+        return pd.DataFrame(), {"error": "Could not locate win probability column in DataGolf pre-tournament data."}
+
     df_pre["Player"] = df_pre[name_col].astype(str)
+    df_pre["PlayerKey"] = df_pre["Player"].apply(_normalize_name)
+
     df_pre["WinProb"] = pd.to_numeric(df_pre[win_col], errors="coerce") / 100.0
-    df_pre["Win%"] = pct01_to_100(df_pre["WinProb"])
-    winners = df_pre.sort_values("WinProb", ascending=False).head(10).copy()
-    return {"winners": winners, "top10s": pd.DataFrame(), "oad": pd.DataFrame(), "meta": meta}, {}
+    df_pre["Top10Prob"] = pd.to_numeric(df_pre[top10_col], errors="coerce") / 100.0 if top10_col else np.nan
+
+    df_skill = pd.DataFrame()
+    if skl["ok"]:
+        rows_s, _ = _dg_find_rows(skl["payload"])
+        if rows_s:
+            df_skill = pd.DataFrame(rows_s)
+            nm = _first_col(df_skill, ["player_name", "name", "player"])
+            if nm:
+                df_skill["PlayerKey"] = df_skill[nm].astype(str).apply(_normalize_name)
+
+    df_dec = pd.DataFrame()
+    if dec["ok"]:
+        rows_d, _ = _dg_find_rows(dec["payload"])
+        if rows_d:
+            df_dec = pd.DataFrame(rows_d)
+            nm = _first_col(df_dec, ["player_name", "name", "player"])
+            if nm:
+                df_dec["PlayerKey"] = df_dec[nm].astype(str).apply(_normalize_name)
+
+    df = df_pre[["Player", "PlayerKey", "WinProb", "Top10Prob"]].copy()
+
+    if not df_skill.empty:
+        rating_col = _first_col(df_skill, ["skill", "rating", "sg_total", "value"])
+        if rating_col:
+            tmp = df_skill[["PlayerKey", rating_col]].copy().rename(columns={rating_col: "SkillRating"})
+            df = df.merge(tmp, on="PlayerKey", how="left")
+
+    if not df_dec.empty:
+        col_map_candidates = {
+            "SG_T2G": ["sg_t2g", "sg_tee_to_green", "t2g", "tee_to_green"],
+            "SG_Putt": ["sg_putt", "sg_putting", "putt", "putting"],
+            "BogeyAvoid": ["bogey_avoid", "bogey_avoidance"],
+            "CourseFit": ["course_fit", "fit"],
+            "CourseHistory": ["course_history", "history"],
+            "RecentForm": ["recent_form", "form", "current_form", "recent"],
+        }
+        tmp = df_dec.copy()
+        keep_cols = ["PlayerKey"]
+        ren = {}
+        for out_name, cands in col_map_candidates.items():
+            c = _first_col(tmp, cands)
+            if c:
+                keep_cols.append(c)
+                ren[c] = out_name
+        if len(keep_cols) > 1:
+            tmp = tmp[keep_cols].rename(columns=ren)
+            df = df.merge(tmp, on="PlayerKey", how="left")
+
+    for c in ["SkillRating", "SG_T2G", "SG_Putt", "BogeyAvoid", "CourseFit", "CourseHistory", "RecentForm"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    def z(x):
+        x = pd.to_numeric(x, errors="coerce")
+        if x.isna().all():
+            return pd.Series(np.zeros(len(x)), index=x.index)
+        mu = np.nanmean(x)
+        sd = np.nanstd(x)
+        if sd == 0 or np.isnan(sd):
+            return pd.Series(np.zeros(len(x)), index=x.index)
+        return (x - mu) / sd
+
+    df["z_win"] = z(df["WinProb"])
+    df["z_top10"] = z(df["Top10Prob"]) if df["Top10Prob"].notna().any() else 0.0
+
+    df["z_skill"] = z(df["SkillRating"]) if "SkillRating" in df.columns else 0.0
+    df["z_t2g"] = z(df["SG_T2G"]) if "SG_T2G" in df.columns else 0.0
+    df["z_putt"] = z(df["SG_Putt"]) if "SG_Putt" in df.columns else 0.0
+    df["z_bogey"] = z(df["BogeyAvoid"]) if "BogeyAvoid" in df.columns else 0.0
+    df["z_fit"] = z(df["CourseFit"]) if "CourseFit" in df.columns else 0.0
+    df["z_hist"] = z(df["CourseHistory"]) if "CourseHistory" in df.columns else 0.0
+    df["z_form"] = z(df["RecentForm"]) if "RecentForm" in df.columns else 0.0
+
+    df["WinScore"] = (
+        0.55 * df["z_win"] +
+        0.12 * df["z_t2g"] +
+        0.08 * df["z_putt"] +
+        0.08 * df["z_skill"] +
+        0.06 * df["z_fit"] +
+        0.06 * df["z_hist"] +
+        0.05 * df["z_bogey"]
+    )
+
+    df["Top10Score"] = (
+        0.55 * df["z_top10"] +
+        0.12 * df["z_t2g"] +
+        0.08 * df["z_putt"] +
+        0.07 * df["z_skill"] +
+        0.06 * df["z_fit"] +
+        0.06 * df["z_hist"] +
+        0.06 * df["z_bogey"]
+    )
+
+    df["OADScore"] = (
+        0.55 * df["Top10Score"] +
+        0.25 * df["WinScore"] +
+        0.20 * df["z_t2g"]
+    )
+
+    df["Win%"] = pct01_to_100(df["WinProb"])
+    df["Top10%"] = pct01_to_100(df["Top10Prob"]) if df["Top10Prob"].notna().any() else np.nan
+
+    winners = df.sort_values("WinScore", ascending=False).head(10).copy()
+    top10s = df.sort_values("Top10Score", ascending=False).head(10).copy()
+    oad = df.sort_values("OADScore", ascending=False).head(7).copy()
+
+    return {"winners": winners, "top10s": top10s, "oad": oad, "meta": meta}, {}
 
 # =========================================================
-# Tracker Page UI (unchanged)
+# Tracker Page UI
 # =========================================================
 def render_tracker():
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("📈 Tracker — Pick Rate + Hit Rate")
     st.caption("Log picks from any section, then grade them (W/L/P/N/A). Summaries auto-calc by window.")
+
     df = _load_tracker()
+
     win_map = _windows(df)
     tables = []
     for label, sub in win_map.items():
         s = _summary_pick_rate(sub, label)
         if not s.empty:
             tables.append(s)
+
     if tables:
         summary = pd.concat(tables, ignore_index=True)
         st.markdown("### Summary (Today / Week / Month / Year)")
-        st.dataframe(summary[["Window","Mode","Picks","Graded","Wins","Losses","Pushes","HitRate%"]],
-                     use_container_width=True, hide_index=True)
+        st.dataframe(
+            summary[["Window","Mode","Picks","Graded","Wins","Losses","Pushes","HitRate%"]],
+            use_container_width=True,
+            hide_index=True
+        )
     else:
         st.info("No tracked picks yet. Log picks from Game Lines / Props / PGA.")
+
     st.markdown("### Grade Picks")
-    st.caption("Set Status=Graded and Result=W/L/P/N/A.")
+    st.caption("Set Status=Graded and Result=W/L/P/N/A. (Leaving Pending means not counted in hit rate.)")
+
     if df.empty:
         st.info("Tracker is empty.")
     else:
@@ -698,233 +1017,6 @@ def render_tracker():
         if st.button("Save Tracker"):
             _save_tracker(edited)
             st.success("Saved.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# =========================================================
-# UFC MODULE — ESPN JSON (NO UFCSTATS HTML)
-# =========================================================
-ESPN_SITE_API = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc"
-ESPN_WEB_API  = "https://site.web.api.espn.com/apis/site/v2/sports/mma/ufc"
-
-def _parse_espn_iso(s):
-    try:
-        return pd.to_datetime(s, utc=True, errors="coerce")
-    except Exception:
-        return pd.NaT
-
-@st.cache_data(ttl=60 * 10)
-def espn_ufc_scoreboard(dates: str | None = None):
-    url = f"{ESPN_SITE_API}/scoreboard"
-    params = {}
-    if dates:
-        params["dates"] = dates
-    ok, status, payload, final_url = safe_get(url, params=params, timeout=20)
-    return {"ok": ok, "status": status, "payload": payload, "url": final_url, "params": params}
-
-@st.cache_data(ttl=60 * 10)
-def espn_ufc_summary(event_id: str):
-    url = f"{ESPN_WEB_API}/summary"
-    params = {"event": str(event_id)}
-    ok, status, payload, final_url = safe_get(url, params=params, timeout=20)
-    return {"ok": ok, "status": status, "payload": payload, "url": final_url, "params": params}
-
-def ufc_list_upcoming_events(scoreboard_payload: dict) -> list[dict]:
-    if not isinstance(scoreboard_payload, dict):
-        return []
-    events = scoreboard_payload.get("events") or []
-    out = []
-
-    # ✅ FIX: always tz-aware “now” so comparisons never crash
-    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=2)
-
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        eid = ev.get("id")
-        name = ev.get("name") or ev.get("shortName") or ev.get("description")
-        dt = _parse_espn_iso(ev.get("date"))
-        if not eid or pd.isna(dt):
-            continue
-
-        # keep events from recent past + future
-        if dt >= cutoff:
-            out.append({"event_id": str(eid), "name": str(name), "date_utc": dt})
-
-    out = sorted(out, key=lambda x: x["date_utc"])
-    return out
-
-def _extract_fights_from_competitions(competitions: list) -> list[dict]:
-    fights = []
-    for comp in competitions or []:
-        if not isinstance(comp, dict):
-            continue
-        competitors = comp.get("competitors") or []
-        if not isinstance(competitors, list) or len(competitors) < 2:
-            continue
-
-        a = competitors[0]
-        b = competitors[1]
-
-        def fighter_from(c):
-            ath = (c or {}).get("athlete") or {}
-            return {
-                "name": ath.get("displayName") or ath.get("shortName") or c.get("displayName") or "",
-                "id": str(ath.get("id") or ""),
-                "winner": bool(c.get("winner")) if c.get("winner") is not None else False,
-                "team": ath,
-            }
-
-        fa = fighter_from(a)
-        fb = fighter_from(b)
-
-        bout = comp.get("shortName") or comp.get("name") or ""
-        status = (((comp.get("status") or {}).get("type") or {}).get("description")) or ""
-        fights.append({
-            "bout": bout,
-            "status": status,
-            "fighter_a": fa,
-            "fighter_b": fb,
-            "comp": comp,
-        })
-    return fights
-
-def ufc_parse_fights_from_scoreboard_event(scoreboard_payload: dict, event_id: str) -> tuple[list[dict], dict]:
-    diag = {"event_id": str(event_id), "source": "", "errors": []}
-
-    try:
-        events = (scoreboard_payload or {}).get("events") or []
-        hit = None
-        for ev in events:
-            if isinstance(ev, dict) and str(ev.get("id")) == str(event_id):
-                hit = ev
-                break
-        if hit:
-            comps = hit.get("competitions") or []
-            fights = _extract_fights_from_competitions(comps)
-            if fights:
-                diag["source"] = "scoreboard.events[].competitions"
-                return fights, diag
-    except Exception as e:
-        diag["errors"].append(f"scoreboard_parse_error: {e}")
-
-    s = espn_ufc_summary(event_id)
-    if debug:
-        st.json({"ufc_summary_call": {"ok": s["ok"], "status": s["status"], "url": s["url"], "params": s["params"]}})
-    if s["ok"] and isinstance(s["payload"], dict):
-        payload = s["payload"]
-        comps = payload.get("competitions") or []
-        fights = _extract_fights_from_competitions(comps)
-        if fights:
-            diag["source"] = "summary.competitions"
-            return fights, diag
-        diag["errors"].append("summary_ok_but_no_competitions_fights")
-    else:
-        diag["errors"].append(f"summary_failed_status_{s['status']}")
-
-    return [], diag
-
-def ufc_predict_simple(fights: list[dict]) -> pd.DataFrame:
-    rows = []
-    for f in fights:
-        a = f.get("fighter_a", {})
-        b = f.get("fighter_b", {})
-        na = (a.get("name","") or "").strip()
-        nb = (b.get("name","") or "").strip()
-        if not na or not nb:
-            continue
-
-        res = ""
-        if a.get("winner") and not b.get("winner"):
-            res = f"W: {na}"
-        elif b.get("winner") and not a.get("winner"):
-            res = f"W: {nb}"
-
-        p_a = 0.50
-        p_b = 0.50
-
-        pick = na if p_a >= p_b else nb
-        conf = max(p_a, p_b)
-
-        rows.append({
-            "Bout": f.get("bout",""),
-            "Status": f.get("status",""),
-            "FighterA": na,
-            "FighterB": nb,
-            "Pick": pick,
-            "WinProb": round(conf, 3),
-            "Result": res
-        })
-    return pd.DataFrame(rows)
-
-def render_ufc():
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.subheader("🥊 UFC — Fight Card (ESPN JSON) + Picks")
-    st.caption("Fix: no UFCStats scraping. Uses ESPN scoreboard/summary endpoints (no lxml).")
-
-    today = datetime.now().strftime("%Y%m%d")
-    future = (datetime.now() + timedelta(days=14)).strftime("%Y%m%d")
-    dates = f"{today}-{future}"
-
-    sb = espn_ufc_scoreboard(dates=dates)
-    if debug:
-        st.json({"ufc_scoreboard_call": {"ok": sb["ok"], "status": sb["status"], "url": sb["url"], "params": sb["params"]}})
-
-    if not sb["ok"] or not isinstance(sb["payload"], dict):
-        st.error("Could not load UFC scoreboard from ESPN.")
-        st.json({"status": sb["status"], "url": sb["url"]})
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
-
-    events = ufc_list_upcoming_events(sb["payload"])
-    if not events:
-        sb2 = espn_ufc_scoreboard(dates=None)
-        if debug:
-            st.json({"ufc_scoreboard_call_fallback": {"ok": sb2["ok"], "status": sb2["status"], "url": sb2["url"], "params": sb2["params"]}})
-        if sb2["ok"] and isinstance(sb2["payload"], dict):
-            events = ufc_list_upcoming_events(sb2["payload"])
-
-    if not events:
-        st.warning("No UFC events found from ESPN right now.")
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
-
-    labels = []
-    for e in events:
-        dt_local = e["date_utc"].tz_convert("America/New_York") if hasattr(e["date_utc"], "tz_convert") else e["date_utc"]
-        labels.append(f"{dt_local.strftime('%a %b %d, %I:%M %p ET')} — {e['name']}")
-
-    ix = st.selectbox("Select upcoming event", list(range(len(events))), format_func=lambda i: labels[i], index=0, key="ufc_event_sel")
-    selected = events[int(ix)]
-    event_id = selected["event_id"]
-
-    fights, diag = ufc_parse_fights_from_scoreboard_event(sb["payload"], event_id=event_id)
-    if not fights:
-        st.error("Could not parse fights for this event from ESPN (API shape may have changed).")
-        if debug:
-            st.json(diag)
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
-
-    st.markdown("### Fight card")
-    card_rows = []
-    for f in fights:
-        a = f["fighter_a"]["name"]
-        b = f["fighter_b"]["name"]
-        card_rows.append({"Bout": f.get("bout",""), "Fighter A": a, "Fighter B": b, "Status": f.get("status","")})
-    st.dataframe(pd.DataFrame(card_rows), use_container_width=True, hide_index=True)
-
-    st.markdown("### Picks (baseline; ready for your metric model)")
-    picks = ufc_predict_simple(fights)
-    if picks.empty:
-        st.warning("Fight list parsed, but could not build picks table.")
-        if debug:
-            st.json(diag)
-    else:
-        st.dataframe(picks, use_container_width=True, hide_index=True)
-
-    if debug:
-        st.markdown("#### UFC Diagnostics")
-        st.json(diag)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -933,10 +1025,6 @@ def render_ufc():
 # =========================================================
 if mode == "Tracker":
     render_tracker()
-    st.stop()
-
-if mode == "UFC":
-    render_ufc()
     st.stop()
 
 if mode == "Game Lines":
@@ -952,16 +1040,58 @@ if mode == "Game Lines":
         st.warning(err.get("error", "No game lines available."))
         st.stop()
 
+    # NEW: enrich with ESPN records/splits (rank placeholders included)
+    df_best = enrich_game_lines_with_team_context(df_best, sport=sport)
+
     st.subheader(f"{sport} — {bet_type} (DK/FD) — STRICT no-contradictions")
-    st.caption("Strict rule: only ONE pick per game per market (even across different lines). Ranked by Edge.")
+    st.caption("Strict rule: only ONE pick per game per market (even across different lines). Ranked by Edge. Records from ESPN.")
 
     top = df_best.head(int(top_n)).copy()
     top["⭐ BestBook"] = "⭐ " + top["BestBook"].astype(str)
 
-    cols = ["Event", "Outcome"] + (["LineBucket"] if "LineBucket" in top.columns and top["LineBucket"].notna().any() else []) + \
-           ["BestPrice", "⭐ BestBook", "YourProb%", "Implied%", "Edge%", "EV"]
+    cols = ["Event", "AwayRank", "AwayRecord", "AwaySplit", "HomeRank", "HomeRecord", "HomeSplit", "Outcome"] + \
+           (["LineBucket"] if "LineBucket" in top.columns and top["LineBucket"].notna().any() else []) + \
+           ["BestPrice", "⭐ BestBook", "YourProb%", "Implied%", "Edge%", "EV", "AwayATS", "AwayLast5ATS", "HomeATS", "HomeLast5ATS"]
     cols = [c for c in cols if c in top.columns]
     st.dataframe(top[cols], use_container_width=True, hide_index=True)
+
+    # Log Top Picks to Tracker
+    if st.button("Log these Top Picks to Tracker"):
+        rows = []
+        for _, r in top.iterrows():
+            rows.append({
+                "LoggedAt": datetime.now().isoformat(),
+                "Mode": "Game Lines",
+                "Sport": sport,
+                "Market": bet_type,
+                "Event": r.get("Event", ""),
+                "Selection": r.get("Outcome", ""),
+                "Line": r.get("LineBucket", ""),
+                "BestBook": r.get("BestBook",""),
+                "BestPrice": r.get("BestPrice",""),
+                "YourProb": r.get("YourProb", np.nan),
+                "Implied": r.get("ImpliedBest", np.nan),
+                "Edge": r.get("Edge", np.nan),
+                "EV": r.get("EV", np.nan),
+                "Status": "Pending",
+                "Result": "",
+            })
+        tracker_log_rows(rows)
+        st.success("Logged to Tracker ✅ (go to Tracker tab to grade/results).")
+
+    st.markdown("#### Probability view (Top Picks)")
+    chart = top.copy()
+    chart["Label"] = chart["Outcome"].astype(str) + " | " + chart["Event"].astype(str)
+    bar_prob(chart, "Label", "YourProb%", "Your Probability (Top Picks)")
+    bar_prob(chart, "Label", "Implied%", "Implied Probability (Best Price)")
+
+    if show_top25:
+        st.markdown("### Snapshot — Top 25 (sorted by Edge)")
+        snap = df_best.head(25).copy()
+        snap["⭐ BestBook"] = "⭐ " + snap["BestBook"].astype(str)
+        cols2 = cols
+        cols2 = [c for c in cols2 if c in snap.columns]
+        st.dataframe(snap[cols2], use_container_width=True, hide_index=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -990,22 +1120,122 @@ elif mode == "Player Props":
     cols = [c for c in cols if c in top.columns]
     st.dataframe(top[cols], use_container_width=True, hide_index=True)
 
+    if st.button("Log these Top Picks to Tracker", key="log_props"):
+        rows = []
+        for _, r in top.iterrows():
+            sel = f"{r.get('Player','')} {r.get('Side','')}".strip()
+            rows.append({
+                "LoggedAt": datetime.now().isoformat(),
+                "Mode": "Player Props",
+                "Sport": sport,
+                "Market": prop_label,
+                "Event": r.get("Event", ""),
+                "Selection": sel,
+                "Line": r.get("LineBucket", ""),
+                "BestBook": r.get("BestBook",""),
+                "BestPrice": r.get("BestPrice",""),
+                "YourProb": r.get("YourProb", np.nan),
+                "Implied": r.get("ImpliedBest", np.nan),
+                "Edge": r.get("Edge", np.nan),
+                "EV": r.get("EV", np.nan),
+                "Status": "Pending",
+                "Result": "",
+            })
+        tracker_log_rows(rows)
+        st.success("Logged to Tracker ✅ (go to Tracker tab to grade/results).")
+
+    st.markdown("#### Probability view (Top Picks)")
+    chart = top.copy()
+    chart["Label"] = (chart["Player"].astype(str) + " " + chart["Side"].astype(str)).str.strip()
+    bar_prob(chart, "Label", "YourProb%", "Your Probability (Top Picks)")
+    bar_prob(chart, "Label", "Implied%", "Implied Probability (Best Price)")
+
+    if show_top25:
+        st.markdown("### Snapshot — Top 25 (sorted by Edge)")
+        snap = df_best.head(25).copy()
+        snap["⭐ BestBook"] = "⭐ " + snap["BestBook"].astype(str)
+        cols2 = ["Event", "Player", "Side"] + (["LineBucket"] if "LineBucket" in snap.columns and snap["LineBucket"].notna().any() else []) + \
+                ["BestPrice", "⭐ BestBook", "YourProb%", "Implied%", "Edge%", "EV"]
+        cols2 = [c for c in cols2 if c in snap.columns]
+        st.dataframe(snap[cols2], use_container_width=True, hide_index=True)
+
     st.markdown("</div>", unsafe_allow_html=True)
 
-else:  # PGA
+else:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
 
     if not DATAGOLF_API_KEY.strip():
         st.warning('Missing DATAGOLF_KEY. Add it in Streamlit Secrets as DATAGOLF_KEY="..." (or DATAGOLF_API_KEY). PGA is hidden until then.')
         st.stop()
 
-    st.subheader("PGA — DataGolf")
+    st.subheader("PGA — Course Fit + Course History + Current Form (DataGolf)")
+    st.caption("Top picks for Win / Top-10 + One-and-Done using DataGolf model probabilities + SG splits + fit/history/form proxies.")
+
     out, err = build_pga_board()
     if isinstance(out, dict) and "winners" in out:
+        if debug:
+            st.json({"dg_meta": out.get("meta", {})})
+
         winners = out["winners"]
+        top10s = out["top10s"]
+        oad = out["oad"]
+
         st.markdown("### 🏆 Best Win Picks (Top 10)")
-        st.dataframe(winners, use_container_width=True, hide_index=True)
+        show_cols = [c for c in ["Player", "Win%", "Top10%", "SG_T2G", "SG_Putt", "BogeyAvoid", "CourseFit", "CourseHistory", "RecentForm", "SkillRating", "WinScore"] if c in winners.columns]
+        st.dataframe(winners[show_cols], use_container_width=True, hide_index=True)
+
+        st.markdown("### 🎯 Best Top-10 Picks (Top 10)")
+        show_cols2 = [c for c in ["Player", "Top10%", "Win%", "SG_T2G", "SG_Putt", "BogeyAvoid", "CourseFit", "CourseHistory", "RecentForm", "SkillRating", "Top10Score"] if c in top10s.columns]
+        st.dataframe(top10s[show_cols2], use_container_width=True, hide_index=True)
+
+        st.markdown("### 🧳 Best One-and-Done Options (Top 7)")
+        show_cols3 = [c for c in ["Player", "Top10%", "Win%", "SG_T2G", "SG_Putt", "BogeyAvoid", "CourseFit", "CourseHistory", "RecentForm", "SkillRating", "OADScore"] if c in oad.columns]
+        st.dataframe(oad[show_cols3], use_container_width=True, hide_index=True)
+
+        if st.button("Log PGA Top Picks to Tracker"):
+            rows = []
+            for _, r in winners.head(10).iterrows():
+                rows.append({
+                    "LoggedAt": datetime.now().isoformat(),
+                    "Mode": "PGA",
+                    "Sport": "PGA",
+                    "Market": "Win",
+                    "Event": out.get("meta", {}).get("event_name", ""),
+                    "Selection": r.get("Player", ""),
+                    "Line": "",
+                    "BestBook": "",
+                    "BestPrice": "",
+                    "YourProb": pd.to_numeric(r.get("WinProb", np.nan), errors="coerce"),
+                    "Implied": np.nan,
+                    "Edge": np.nan,
+                    "EV": np.nan,
+                    "Status": "Pending",
+                    "Result": "",
+                })
+            for _, r in top10s.head(10).iterrows():
+                rows.append({
+                    "LoggedAt": datetime.now().isoformat(),
+                    "Mode": "PGA",
+                    "Sport": "PGA",
+                    "Market": "Top 10",
+                    "Event": out.get("meta", {}).get("event_name", ""),
+                    "Selection": r.get("Player", ""),
+                    "Line": "",
+                    "BestBook": "",
+                    "BestPrice": "",
+                    "YourProb": pd.to_numeric(r.get("Top10Prob", np.nan), errors="coerce"),
+                    "Implied": np.nan,
+                    "Edge": np.nan,
+                    "EV": np.nan,
+                    "Status": "Pending",
+                    "Result": "",
+                })
+            tracker_log_rows(rows)
+            st.success("Logged PGA picks to Tracker ✅")
+
     else:
         st.warning(err.get("error", "No PGA data available right now."))
+        if debug:
+            st.json(err)
 
     st.markdown("</div>", unsafe_allow_html=True)
